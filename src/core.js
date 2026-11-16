@@ -188,6 +188,8 @@ const CFG = {
   // 不在启动时查；每 UPDATE_CHECK_MS 查一次，且只在"空闲窗口"替换+重启
   UPDATE_CHECK_MS: cfgNum(process.env.FTS_UPDATE_CHECK_MS ?? userCfg.UPDATE_CHECK_MS, 1200000, 'UPDATE_CHECK_MS'),
   UPDATE_IDLE_MARGIN: cfgNum(process.env.FTS_UPDATE_IDLE_MARGIN ?? userCfg.UPDATE_IDLE_MARGIN, 15, 'UPDATE_IDLE_MARGIN'),
+  // 如果有新版但一直等不到空闲窗口(连续抢单)，最多推迟这么久就强制更新一次
+  UPDATE_MAX_DEFER_MS: cfgNum(process.env.FTS_UPDATE_MAX_DEFER_MS ?? userCfg.UPDATE_MAX_DEFER_MS, 7200000, 'UPDATE_MAX_DEFER_MS'),
   MIN_BNB_GAS: cfgNum(process.env.FTS_MIN_BNB ?? userCfg.MIN_BNB_GAS, 0.005, 'MIN_BNB_GAS'),
   // nonce 断档自愈: 发现"有在途交易但 latest 长期不动"就补一笔自转填坑
   GAP_CHECK_MS: cfgNum(process.env.FTS_GAP_CHECK_MS, 20000, 'GAP_CHECK_MS'),
@@ -266,6 +268,7 @@ function validateCfg() {
   if (CFG.MINING_CLAIM_MS < 15000) { p.push('MINING_CLAIM_MS 太小，已改为 15000'); CFG.MINING_CLAIM_MS = 15000; }
   if (CFG.UPDATE_CHECK_MS < 60000) { p.push('UPDATE_CHECK_MS 太小，已改为 60000'); CFG.UPDATE_CHECK_MS = 60000; }
   if (CFG.UPDATE_IDLE_MARGIN < 0) { p.push('UPDATE_IDLE_MARGIN 不能为负，已改为 15'); CFG.UPDATE_IDLE_MARGIN = 15; }
+  if (CFG.UPDATE_MAX_DEFER_MS < 600000) { p.push('UPDATE_MAX_DEFER_MS 太小，已改为 600000'); CFG.UPDATE_MAX_DEFER_MS = 600000; }
   return p.concat(cfgProblems);
 }
 
@@ -1683,6 +1686,7 @@ async function miningClaimLoop(inst) {
 // 等到"没有轮次接近满员 / 没有交易在途 / 没有结算中"的空闲窗口，
 // 才替换脚本并 exit 90，由外壳脚本原地重启。
 let updatePendingTag = null;
+let updatePendingSince = 0;
 let updateBusy = false;
 
 function runUpdateCli(args) {
@@ -1708,8 +1712,11 @@ function isBusyForRestart() {
   return false;
 }
 
-async function tryApplyUpdate(asset) {
-  if (isBusyForRestart()) return false;
+async function tryApplyUpdate(asset, force) {
+  if (!force && isBusyForRestart()) {
+    warnOnce('SYS', `有新版本 v${updatePendingTag}，当前正在抢单/有交易在途，暂缓更新`, 300000);
+    return false;
+  }
   info('SYS', `进入空闲窗口，开始更新到 v${updatePendingTag} ...`);
   const out = await runUpdateCli(['--apply', '--current=' + APP_VERSION, '--asset=' + asset]);
   if (/UPDATED\s+(\S+)/.test(out)) {
@@ -1728,8 +1735,9 @@ async function updateLoop() {
   while (true) {
     try {
       if (updatePendingTag) {
-        await tryApplyUpdate(asset);             // 忙就返回 false，30 秒后再看
-        await sleep(30000);
+        const force = updatePendingSince && Date.now() - updatePendingSince > CFG.UPDATE_MAX_DEFER_MS;
+        await tryApplyUpdate(asset, force);       // 忙就返回 false，10 秒后再看
+        await sleep(10000);
         continue;
       }
       if (!updateBusy) {
@@ -1738,6 +1746,7 @@ async function updateLoop() {
         updateBusy = false;
         if (/NEWER\s+(\S+)/.test(out)) {
           updatePendingTag = RegExp.$1;
+          updatePendingSince = Date.now();
           info('SYS', `发现新版本 v${updatePendingTag}，将等空闲窗口自动更新(不打断抢单)`);
         } else if (/SKIP_AUTH|SKIP_PRIVATE/.test(out)) {
           warnOnce('SYS', '自动更新跳过: 需要 GitHub 只读 token（--init 的 [10] 自动更新）', 3600000);
