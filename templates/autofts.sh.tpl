@@ -9,6 +9,7 @@ export FTS_LAUNCHER=bash
 
 WORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$WORK_DIR" || exit 1
+ORIG_ARGS=("$@")        # 自动更新后原地重启用
 mkdir -p logs
 # Windows 上用记事本把 json 存成 "UTF-8 带 BOM" 时，JSON.parse 会直接抛错、
 # 整份配置被静默忽略。启动时统一把 BOM 去掉，一劳永逸。
@@ -51,6 +52,7 @@ usage() {
   MIN_BNB_GAS        最低 BNB 提醒阈值，默认 0.005
   MINING_CLAIM_MS    矿机产出领取扫描间隔，默认 45000（只要可领就立刻领）
   UPDATE_TOKEN       自动更新用的 GitHub 只读 token（在 --init 里配置）
+  UPDATE_CHECK_MS    自动更新检查间隔，默认 1200000（20 分钟，仅在空闲窗口替换）
   MINER_ENABLED      是否自动组矿机；MINER_MODE=old/new/both
 HELP
   exit 0
@@ -310,22 +312,6 @@ if [ "$MODE" = "update" ]; then
   echo ""
   node update.js --apply --current="@@VERSION@@" --asset=autofts.sh
   exit $?
-fi
-
-# ---- 自动更新检查（默认开启；10 分钟内只查一次）----
-if [ "$MODE" = "run" ] || [ "$MODE" = "dry-run" ]; then
-  AUTO_UPDATE="$(node -e 'let a="1";try{const c=JSON.parse(require("fs").readFileSync("config.json","utf8"));if(c.AUTO_UPDATE===false||c.AUTO_UPDATE==="0"||c.AUTO_UPDATE===0)a="0"}catch(e){}process.stdout.write(a)' 2>/dev/null)"
-  if [ "${AUTO_UPDATE:-1}" = "1" ]; then
-    UOUT="$(node update.js --auto --current="@@VERSION@@" --asset=autofts.sh 2>/dev/null || true)"
-    case "$UOUT" in
-      UPDATED*) ok_msg "脚本已自动更新（$UOUT），请重新运行本脚本"; exit 0 ;;
-    esac
-  else
-    UOUT="$(node update.js --check --current="@@VERSION@@" --asset=autofts.sh 2>/dev/null || true)"
-    case "$UOUT" in
-      NEWER*) warn_msg "发现新版本 ${UOUT#NEWER }，运行 ./autofts.sh --update 一键更新" ;;
-    esac
-  fi
 fi
 
 # ==============================================================
@@ -995,6 +981,11 @@ while [ "$RUNNING" = 1 ]; do
       die "没有可用账号，请执行: bash autofts.sh --init" ;;
     22)
       warn_msg "RPC 全部不可用，10 秒后重试..."; sleep 10; RESTARTS=$((RESTARTS+1)) ;;
+    90)
+      echo ""
+      ok_msg "已更新到新版本，正在原地重启(空闲窗口内完成，不影响后续排期)..."
+      RESTARTS=0
+      exec bash "$0" "${ORIG_ARGS[@]}" ;;
     *)
       RESTARTS=$((RESTARTS+1))
       if [ "$RESTARTS" -gt "$RESTART_MAX" ]; then die "连续崩溃超过 ${RESTART_MAX} 次，停止重启。请查看 logs/ 排查"; fi

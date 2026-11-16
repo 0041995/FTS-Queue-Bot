@@ -156,6 +156,7 @@ function Show-Usage {
   MINING_CLAIM_MS    矿机产出领取扫描间隔，默认 45000（只要可领就立刻领）
   MINER_ENABLED      是否自动组矿机；MINER_MODE=old/new/both
   UPDATE_TOKEN       自动更新用的 GitHub 只读 token（在 --init 里配置）
+  UPDATE_CHECK_MS    自动更新检查间隔，默认 1200000（20 分钟，仅在空闲窗口替换）
 '@
     exit 0
 }
@@ -244,6 +245,7 @@ $DoInit    = $false
 $DoWizard  = $false
 $ProbeArgs = @()
 
+$Script:OrigArgs = @($args)
 for ($i = 0; $i -lt $args.Count; $i++) {
     $a = [string]$args[$i]
     if ($a -eq '--probe') {
@@ -393,22 +395,6 @@ if ($Mode -eq 'update') {
     Write-Host ""
     & $Script:NodeExe update.js --apply --current="@@VERSION@@" --asset=autofts.ps1
     exit $LASTEXITCODE
-}
-
-# ---- 自动更新检查（默认开启；10 分钟内只查一次）----
-if ($Mode -eq 'run' -or $Mode -eq 'dry-run') {
-    $autoUpdate = '1'
-    try {
-        $cfgTmp = Get-Content -LiteralPath 'config.json' -Raw -ErrorAction Stop | ConvertFrom-Json
-        if ($cfgTmp.AUTO_UPDATE -eq $false -or "$($cfgTmp.AUTO_UPDATE)" -eq '0') { $autoUpdate = '0' }
-    } catch { }
-    if ($autoUpdate -eq '1') {
-        $UOut = @(& $Script:NodeExe update.js --auto --current="@@VERSION@@" --asset=autofts.ps1 2>$null)
-        if (($UOut -join ' ') -match 'UPDATED') { Write-Ok ("脚本已自动更新（" + ($UOut -join ' ') + "），请重新运行"); exit 0 }
-    } else {
-        $UOut = @(& $Script:NodeExe update.js --check --current="@@VERSION@@" --asset=autofts.ps1 2>$null)
-        if (($UOut -join ' ') -match 'NEWER\s+(\S+)') { Write-WarnMsg "发现新版本 $($Matches[1])，运行: powershell -ExecutionPolicy Bypass -File .\autofts.ps1 --update" }
-    }
 }
 
 # ============================================================
@@ -1100,6 +1086,12 @@ while ($running) {
         Write-WarnMsg "RPC 全部不可用，10 秒后重试..."
         Start-Sleep -Seconds 10
         $restarts++
+    }
+    elseif ($code -eq 90) {
+        Write-Ok "已更新到新版本，正在原地重启(空闲窗口内完成)..."
+        Start-Sleep -Seconds 1
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @Script:OrigArgs
+        exit $LASTEXITCODE
     }
     else {
         $restarts++

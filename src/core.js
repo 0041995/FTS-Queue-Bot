@@ -25,6 +25,7 @@ try {
 
 const fs = require('fs');
 const path = require('path');
+const { execFile } = require('child_process');
 
 const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
@@ -181,6 +182,10 @@ const CFG = {
     return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
   })(),
   MINING_CLAIM_MS: cfgNum(process.env.FTS_MINING_CLAIM_MS ?? userCfg.MINING_CLAIM_MS, 45000, 'MINING_CLAIM_MS'),
+  // ---- 运行期自动更新 ----
+  // 不在启动时查；每 UPDATE_CHECK_MS 查一次，且只在"空闲窗口"替换+重启
+  UPDATE_CHECK_MS: cfgNum(process.env.FTS_UPDATE_CHECK_MS ?? userCfg.UPDATE_CHECK_MS, 1200000, 'UPDATE_CHECK_MS'),
+  UPDATE_IDLE_MARGIN: cfgNum(process.env.FTS_UPDATE_IDLE_MARGIN ?? userCfg.UPDATE_IDLE_MARGIN, 15, 'UPDATE_IDLE_MARGIN'),
   MIN_BNB_GAS: cfgNum(process.env.FTS_MIN_BNB ?? userCfg.MIN_BNB_GAS, 0.005, 'MIN_BNB_GAS'),
   // nonce 断档自愈: 发现"有在途交易但 latest 长期不动"就补一笔自转填坑
   GAP_CHECK_MS: cfgNum(process.env.FTS_GAP_CHECK_MS, 20000, 'GAP_CHECK_MS'),
@@ -257,6 +262,8 @@ function validateCfg() {
     CFG.MINER_MODE = 'old';
   }
   if (CFG.MINING_CLAIM_MS < 15000) { p.push('MINING_CLAIM_MS 太小，已改为 15000'); CFG.MINING_CLAIM_MS = 15000; }
+  if (CFG.UPDATE_CHECK_MS < 60000) { p.push('UPDATE_CHECK_MS 太小，已改为 60000'); CFG.UPDATE_CHECK_MS = 60000; }
+  if (CFG.UPDATE_IDLE_MARGIN < 0) { p.push('UPDATE_IDLE_MARGIN 不能为负，已改为 15'); CFG.UPDATE_IDLE_MARGIN = 15; }
   return p.concat(cfgProblems);
 }
 
@@ -1080,6 +1087,7 @@ function startGapFixer(inst) {
 // ---------------- 统一交易发送 ----------------
 async function sendTx(inst, opt) {
   const release = await inst.mutex.acquire();
+  inst.inflight = (inst.inflight || 0) + 1;
   try {
     // 跨 attempt 保留的 nonce: 第一次读出来就锁定。
     // 不锁的话: attempt 1 广播超时(交易其实可能已进 mempool)后 inst.nonce 仍是 null，
@@ -1234,6 +1242,7 @@ async function sendTx(inst, opt) {
     }
     return false;
   } finally {
+    inst.inflight = Math.max(0, (inst.inflight || 1) - 1);
     release();
   }
 }
@@ -1667,6 +1676,79 @@ async function miningClaimLoop(inst) {
   }
 }
 
+// ---------------- 运行期自动更新(空闲窗口) ----------------
+// 不在启动时检查。每 UPDATE_CHECK_MS 查一次；发现新版先记下来，
+// 等到"没有轮次接近满员 / 没有交易在途 / 没有结算中"的空闲窗口，
+// 才替换脚本并 exit 90，由外壳脚本原地重启。
+let updatePendingTag = null;
+let updateBusy = false;
+
+function runUpdateCli(args) {
+  return new Promise(resolve => {
+    execFile(process.execPath, [path.join(__dirname, 'update.js'), ...args], {
+      cwd: __dirname,
+      timeout: 45000,
+      windowsHide: true
+    }, (err, stdout) => resolve(String(stdout || '').trim()));
+  });
+}
+
+function isBusyForRestart() {
+  if (instances.some(i => (i.inflight || 0) > 0 || i.busy)) return true;
+  const rooms = sharedCache.rooms;
+  if (!rooms) return true;                       // 状态还没读到，保守不重启
+  const need = Math.max(5, CFG.SNIPE_MIN_COUNT - CFG.UPDATE_IDLE_MARGIN);
+  for (const k of Object.keys(rooms)) {
+    const st = rooms[k];
+    if (!st.enabled) continue;
+    if (st.state === 0 && st.count >= need) return true;           // 快满员，随时要抢
+  }
+  return false;
+}
+
+async function tryApplyUpdate(asset) {
+  if (isBusyForRestart()) return false;
+  info('SYS', `进入空闲窗口，开始更新到 v${updatePendingTag} ...`);
+  const out = await runUpdateCli(['--apply', '--current=' + VERSION, '--asset=' + asset]);
+  if (/UPDATED\s+(\S+)/.test(out)) {
+    ok('SYS', `已更新到 v${RegExp.$1}，准备原地重启...`);
+    await sleep(500);
+    process.exit(90);
+  }
+  err('SYS', '自动更新失败: ' + (out || '无输出'));
+  return false;
+}
+
+async function updateLoop() {
+  const asset = process.platform === 'win32' ? 'autofts.ps1' : 'autofts.sh';
+  // 不在启动时查：先静默等一个周期
+  await sleep(CFG.UPDATE_CHECK_MS + Math.random() * 60000);
+  while (true) {
+    try {
+      if (updatePendingTag) {
+        await tryApplyUpdate(asset);             // 忙就返回 false，30 秒后再看
+        await sleep(30000);
+        continue;
+      }
+      if (!updateBusy) {
+        updateBusy = true;
+        const out = await runUpdateCli(['--check', '--current=' + VERSION, '--asset=' + asset]);
+        updateBusy = false;
+        if (/NEWER\s+(\S+)/.test(out)) {
+          updatePendingTag = RegExp.$1;
+          info('SYS', `发现新版本 v${updatePendingTag}，将等空闲窗口自动更新(不打断抢单)`);
+        } else if (/SKIP_AUTH|SKIP_PRIVATE/.test(out)) {
+          warnOnce('SYS', '自动更新跳过: 需要 GitHub 只读 token（--init 的 [10] 自动更新）', 3600000);
+        }
+      }
+    } catch (e) {
+      updateBusy = false;
+      warnOnce('SYS', '自动更新检查异常: ' + formatError(e), 1800000);
+    }
+    await sleep(CFG.UPDATE_CHECK_MS + Math.random() * 60000);
+  }
+}
+
 // ---------------- 自检 ----------------
 let selftestWallets = [];
 async function selftest() {
@@ -1941,6 +2023,10 @@ async function main() {
     if (CFG.MINER_ENABLED) minerLoop(inst);
     if (CFG.MINING_CLAIM) miningClaimLoop(inst);
   }
+
+  const au = userCfg.AUTO_UPDATE;
+  const autoUpdateOn = !(au === false || au === 0 || au === '0' || au === 'false' || au === 'off');
+  if (MODE === 'run' && autoUpdateOn) updateLoop();   // 仅正式运行：空闲窗口自动更新并重启
 
   const stream = new BlockStream();
   stream.start();
