@@ -246,6 +246,7 @@ $DoWizard  = $false
 $ProbeArgs = @()
 
 $Script:OrigArgs = @($args)
+$env:FTS_APP_VERSION = '@@VERSION@@'
 for ($i = 0; $i -lt $args.Count; $i++) {
     $a = [string]$args[$i]
     if ($a -eq '--probe') {

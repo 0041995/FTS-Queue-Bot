@@ -31,6 +31,8 @@ const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
 const VERSION = '2.2-v8';
+// 包版本(1.3.x)由外壳脚本通过 FTS_APP_VERSION 注入；引擎版本 VERSION 只用于日志
+const APP_VERSION = process.env.FTS_APP_VERSION || '0.0.0';
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
   ? 'powershell -ExecutionPolicy Bypass -File autofts.ps1'
@@ -1709,7 +1711,7 @@ function isBusyForRestart() {
 async function tryApplyUpdate(asset) {
   if (isBusyForRestart()) return false;
   info('SYS', `进入空闲窗口，开始更新到 v${updatePendingTag} ...`);
-  const out = await runUpdateCli(['--apply', '--current=' + VERSION, '--asset=' + asset]);
+  const out = await runUpdateCli(['--apply', '--current=' + APP_VERSION, '--asset=' + asset]);
   if (/UPDATED\s+(\S+)/.test(out)) {
     ok('SYS', `已更新到 v${RegExp.$1}，准备原地重启...`);
     await sleep(500);
@@ -1732,7 +1734,7 @@ async function updateLoop() {
       }
       if (!updateBusy) {
         updateBusy = true;
-        const out = await runUpdateCli(['--check', '--current=' + VERSION, '--asset=' + asset]);
+        const out = await runUpdateCli(['--check', '--current=' + APP_VERSION, '--asset=' + asset]);
         updateBusy = false;
         if (/NEWER\s+(\S+)/.test(out)) {
           updatePendingTag = RegExp.$1;

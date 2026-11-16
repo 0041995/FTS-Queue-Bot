@@ -10,6 +10,7 @@ export FTS_LAUNCHER=bash
 WORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$WORK_DIR" || exit 1
 ORIG_ARGS=("$@")        # 自动更新后原地重启用
+export FTS_APP_VERSION="@@VERSION@@"
 mkdir -p logs
 # Windows 上用记事本把 json 存成 "UTF-8 带 BOM" 时，JSON.parse 会直接抛错、
 # 整份配置被静默忽略。启动时统一把 BOM 去掉，一劳永逸。
