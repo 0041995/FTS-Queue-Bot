@@ -20,6 +20,9 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: 准备 Python
         uses: actions/setup-python@v5
@@ -76,30 +79,40 @@ jobs:
             exit 0
           fi
 
-          cat > NOTES.md <<'EOF'
-          ## 下载
-
-          | 平台 | 文件 |
-          |---|---|
-          | Linux / Termux / macOS | `autofts.sh` |
-          | Windows | `autofts.ps1` |
-
-          两个脚本都是单文件，只需要 Node.js 18+。源码见 `src/`。
-
-          ## 首次使用
-
-          ```
-          --probe  ->  --init  ->  --selftest  ->  --dry-run  ->  --run
-          ```
-
-          `--probe` / `--selftest` 完全只读，不花一分钱。
-
-          ## 校验
-
-          ```
-          sha256sum -c SHA256SUMS.txt
-          ```
-          EOF
+          PREV_TAG="$(git describe --tags --abbrev=0 HEAD 2>/dev/null || true)"
+          {
+            echo "## 更新内容"
+            echo
+            if [ -n "$PREV_TAG" ]; then
+              git log --pretty='- %s' "${PREV_TAG}..HEAD" | head -30
+            else
+              git log --pretty='- %s' -20
+            fi
+            echo
+            printf '%s\n' \
+              '## 下载' \
+              '' \
+              '| 平台 | 文件 |' \
+              '|---|---|' \
+              '| Linux / Termux / macOS | `autofts.sh` |' \
+              '| Windows | `autofts.ps1` |' \
+              '' \
+              '两个脚本都是单文件，只需要 Node.js 18+。源码见 `src/`.' \
+              '' \
+              '## 首次使用' \
+              '' \
+              '```' \
+              '--probe  ->  --init  ->  --selftest  ->  --dry-run  ->  --run' \
+              '```' \
+              '' \
+              '`--probe` / `--selftest` 完全只读，不花一分钱。' \
+              '' \
+              '## 校验' \
+              '' \
+              '```' \
+              'sha256sum -c SHA256SUMS.txt' \
+              '```'
+          } > NOTES.md
 
           gh release create "$TAG" \
             dist/autofts.sh \
