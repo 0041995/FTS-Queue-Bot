@@ -35,6 +35,7 @@ usage() {
   --run        正式运行(默认)
   --init       打开配置向导(房间/抢位区间/延迟/手续费/账号)，配完即退出
   --settings   同 --init，随时回来改设置
+  --update     一键更新到最新版本(原地替换脚本，支持私有仓库)
   --stop       停止后台运行的引擎
   --help       查看本帮助
 
@@ -182,6 +183,7 @@ while [ $# -gt 0 ]; do
     --run)      MODE="run" ;;
     --init)     DO_INIT=1 ;;
     --settings) DO_WIZARD=1 ;;
+    --update)   MODE="update" ;;
     --stop)     stop_engine ;;
     -h|--help)  usage ;;
     *) echo "未知参数: $1 (用 --help 查看用法)"; exit 2 ;;
@@ -284,7 +286,11 @@ cat << 'PROBE_EOF' > probe.js
 PROBE_EOF
 node --check core.js || die "core.js 生成异常(语法错误)"
 node --check probe.js || die "probe.js 生成异常(语法错误)"
-ok_msg "核心引擎 core.js + 只读探针 probe.js 已写入"
+cat << 'UPDATEJS_EOF' > update.js
+@@UPDATE_JS@@
+UPDATEJS_EOF
+node --check update.js || die "update.js 生成异常(语法错误)"
+ok_msg "核心引擎 core.js + 只读探针 probe.js + 更新器 update.js 已写入"
 
 # --probe 是纯只读探测，必须在"要求输入私钥"之前退出
 if [ "$MODE" = "probe" ]; then
@@ -296,6 +302,29 @@ if [ "$MODE" = "probe" ]; then
   # shellcheck disable=SC2086
   node probe.js $PROBE_ARGS
   exit $?
+fi
+
+# --update: 原地替换脚本（私有仓库需在 config.json 写 UPDATE_TOKEN）
+if [ "$MODE" = "update" ]; then
+  echo ""
+  node update.js --apply --current="@@VERSION@@" --asset=autofts.sh
+  exit $?
+fi
+
+# ---- 自动更新检查（默认开启；10 分钟内只查一次）----
+if [ "$MODE" = "run" ] || [ "$MODE" = "dry-run" ]; then
+  AUTO_UPDATE="$(node -e 'let a="1";try{const c=JSON.parse(require("fs").readFileSync("config.json","utf8"));if(c.AUTO_UPDATE===false||c.AUTO_UPDATE==="0"||c.AUTO_UPDATE===0)a="0"}catch(e){}process.stdout.write(a)' 2>/dev/null)"
+  if [ "${AUTO_UPDATE:-1}" = "1" ]; then
+    UOUT="$(node update.js --auto --current="@@VERSION@@" --asset=autofts.sh 2>/dev/null || true)"
+    case "$UOUT" in
+      UPDATED*) ok_msg "脚本已自动更新（$UOUT），请重新运行本脚本"; exit 0 ;;
+    esac
+  else
+    UOUT="$(node update.js --check --current="@@VERSION@@" --asset=autofts.sh 2>/dev/null || true)"
+    case "$UOUT" in
+      NEWER*) warn_msg "发现新版本 ${UOUT#NEWER }，运行 ./autofts.sh --update 一键更新" ;;
+    esac
+  fi
 fi
 
 # ==============================================================

@@ -46,7 +46,7 @@ Fatris 是 BSC 上的排队抽奖游戏：房间分 **10U / 50U / 100U**，每�
 | 你平时要做的 | 它替你做 |
 |---|---|
 | 盯时间表、抢席位 | 7×24 守着，出块就判断，人数落在区间才入场 |
-| 一轮轮点"领取退款 / 空投" | 定时扫描历史轮次，能领就领，不漏单 |
+| 一轮轮点"领取退款 / 空投" | 盯结算：一轮一结算就立即触发领取，另有定时兜底，不漏单 |
 | 中奖后 48 小时内去领额度 | 自动 `claimWin`，不会让奖励过期（可关） |
 | 矿机每天释放一点 FTS，要手动点领取 | 每 45 秒查一次，**只要可领就立刻领**，绝不等释放完 |
 | 额度够了去组 LP 激活矿机 | 自动查额度、授权、`formLP`（可选，老/新/两者） |
@@ -95,6 +95,39 @@ bash autofts.sh --init
 ```
 
 第一次请严格按 `--probe → --init → --selftest → --dry-run → --run` 走一遍。
+
+---
+
+## 自动更新（私有仓库也能用）
+
+脚本每次启动会检查一次新版本（10 分钟内不重复请求）：
+
+- 有新版本时自动下载、校验 SHA256、原地替换脚本，**不用手动覆盖文件**，下次启动即为新版
+- 也可以手动一键更新：
+
+```bash
+./autofts.sh --update          # Linux / Termux
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\autofts.ps1 --update
+```
+
+Release 里还附带 `update.sh` / `update.ps1`，双击/执行即可完成同样的事。
+
+**私有仓库**：GitHub 的 releases 接口需要鉴权。在 `config.json` 里填一个只读 token 即可：
+
+```json
+{
+  "AUTO_UPDATE": true,
+  "UPDATE_REPO": "0041995/FTS-Queue-Bot",
+  "UPDATE_TOKEN": "ghp_你的只读token"
+}
+```
+
+也可以改用环境变量 `FTS_UPDATE_TOKEN`（不落盘）。没有 token 时公开仓库照常更新，私有仓库会静默跳过并在 `--update` 时提示。
+
+> 更新只替换 `autofts.sh` / `autofts.ps1` 本身，`wallets.json`、`config.json`、`logs/` 都不会动；下载失败或校验不通过时**不会覆盖**，旧版继续可用。
 
 > Windows 用户请用 `autofts.ps1`：它会自动收紧钱包文件权限；Git Bash 里跑 `.sh` 版没有这层保护。
 

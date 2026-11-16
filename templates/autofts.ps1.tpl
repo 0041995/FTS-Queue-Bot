@@ -139,6 +139,7 @@ function Show-Usage {
   --run        正式运行(默认)
   --init       打开配置向导(房间/抢位区间/延迟/手续费/账号)，配完即退出
   --settings   同 --init，随时回来改设置
+  --update     一键更新到最新版本(原地替换脚本，支持私有仓库)
   --stop       停止后台运行的引擎
   --help       查看本帮助
 
@@ -254,6 +255,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     elseif ($a -eq '--run')      { $Mode = 'run' }
     elseif ($a -eq '--init')     { $DoInit = $true }
     elseif ($a -eq '--settings') { $DoWizard = $true }
+    elseif ($a -eq '--update')   { $Mode = 'update' }
     elseif ($a -eq '--stop')     { Stop-Engine }
     elseif ($a -eq '-h' -or $a -eq '--help') { Show-Usage }
     else {
@@ -355,17 +357,23 @@ $CoreJs = @'
 $ProbeJs = @'
 @@PROBE_JS@@
 '@
+$UpdateJs = @'
+@@UPDATE_JS@@
+'@
 
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 # 末尾补一个换行，让生成的文件与 Linux 版完全一致(here-string 不含结尾换行)
 [System.IO.File]::WriteAllText((Join-Path $Script:WorkDir 'core.js'),  $CoreJs  + "`r`n", $Utf8NoBom)
 [System.IO.File]::WriteAllText((Join-Path $Script:WorkDir 'probe.js'), $ProbeJs + "`r`n", $Utf8NoBom)
+[System.IO.File]::WriteAllText((Join-Path $Script:WorkDir 'update.js'), $UpdateJs + "`r`n", $Utf8NoBom)
 
 & $Script:NodeExe --check core.js 2>&1 | Out-Host
 if ($LASTEXITCODE -ne 0) { Write-Die "core.js 生成异常(语法错误)" }
 & $Script:NodeExe --check probe.js 2>&1 | Out-Host
 if ($LASTEXITCODE -ne 0) { Write-Die "probe.js 生成异常(语法错误)" }
-Write-Ok "核心引擎 core.js + 只读探针 probe.js 已写入"
+& $Script:NodeExe --check update.js 2>&1 | Out-Host
+if ($LASTEXITCODE -ne 0) { Write-Die "update.js 生成异常(语法错误)" }
+Write-Ok "核心引擎 core.js + 只读探针 probe.js + 更新器 update.js 已写入"
 
 # --probe 是纯只读探测，必须在"要求输入私钥"之前退出
 if ($Mode -eq 'probe') {
@@ -377,6 +385,29 @@ if ($Mode -eq 'probe') {
     Write-Host ""
     & $Script:NodeExe probe.js @ProbeArgs
     exit $LASTEXITCODE
+}
+
+# --update: 原地替换脚本（私有仓库需在 config.json 写 UPDATE_TOKEN）
+if ($Mode -eq 'update') {
+    Write-Host ""
+    & $Script:NodeExe update.js --apply --current="@@VERSION@@" --asset=autofts.ps1
+    exit $LASTEXITCODE
+}
+
+# ---- 自动更新检查（默认开启；10 分钟内只查一次）----
+if ($Mode -eq 'run' -or $Mode -eq 'dry-run') {
+    $autoUpdate = '1'
+    try {
+        $cfgTmp = Get-Content -LiteralPath 'config.json' -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($cfgTmp.AUTO_UPDATE -eq $false -or "$($cfgTmp.AUTO_UPDATE)" -eq '0') { $autoUpdate = '0' }
+    } catch { }
+    if ($autoUpdate -eq '1') {
+        $UOut = @(& $Script:NodeExe update.js --auto --current="@@VERSION@@" --asset=autofts.ps1 2>$null)
+        if (($UOut -join ' ') -match 'UPDATED') { Write-Ok ("脚本已自动更新（" + ($UOut -join ' ') + "），请重新运行"); exit 0 }
+    } else {
+        $UOut = @(& $Script:NodeExe update.js --check --current="@@VERSION@@" --asset=autofts.ps1 2>$null)
+        if (($UOut -join ' ') -match 'NEWER\s+(\S+)') { Write-WarnMsg "发现新版本 $($Matches[1])，运行: powershell -ExecutionPolicy Bypass -File .\autofts.ps1 --update" }
+    }
 }
 
 # ============================================================
