@@ -61,6 +61,7 @@ jobs:
           npm install ethers@6 --no-audit --no-fund --no-save
           node test/sendtx-nonce.js
           node test/approve-guard.js
+          node test/claims-flex.js
 
       - name: 生成校验和
         run: |

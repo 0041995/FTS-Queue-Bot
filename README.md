@@ -46,11 +46,12 @@ Fatris 是 BSC 上的排队抽奖游戏：房间分 **10U / 50U / 100U**，每�
 | 你平时要做的 | 它替你做 |
 |---|---|
 | 盯时间表、抢席位 | 7×24 守着，出块就判断，人数落在区间才入场 |
-| 一轮轮点"领取退款 / 空投" | 每 20 秒扫描一次，能领就领，不漏单 |
+| 一轮轮点"领取退款 / 空投" | 每 20 秒扫描一次，能领就领；余额/gas/网络失败的会重试到窗口结束 |
 | 中奖后 48 小时内去领额度 | 自动 `claimWin`，不会让奖励过期（可关） |
 | 矿机每天释放一点 FTS，要手动点领取 | 每 45 秒查一次，**只要可领就立刻领**，绝不等释放完 |
 | 额度够了去组 LP 激活矿机 | 自动查额度、授权、`formLP`（可选，老/新/两者） |
 | 多个号来回切钱包 | 一个配置管多个账号，各自独立跑 |
+| 某个号 USDT / BNB 差一点就够入场 | 可选"灵活资金决策"：只在报资金不足时，从富余账号匀一点过去（默认关，`--init` 里开） |
 | 节点卡了、交易掉了 | 自动换节点、自动重试、自动补 nonce、崩溃自动重启 |
 
 **一句话：它不改变结果，只保证你不漏场、不漏领、不在无效交易上白烧 gas。**
@@ -241,6 +242,7 @@ MIT，见 [LICENSE](LICENSE)。
 python3 build/build.py      # 产物在 dist/
 node test/sendtx-nonce.js   # nonce 重发回归测试
 node test/approve-guard.js  # 配置边界测试（需 ethers）
+node test/claims-flex.js    # 领取健壮性 / 灵活资金决策测试（需 ethers）
 ```
 
-关键配置：`QUEUE_ADDR`（新队列）、`MINER_MODE`（old/new/both）、`MINER_USD`、`CLAIM_WIN`。更细的字段和原理见源码注释。
+关键配置：`QUEUE_ADDR`（新队列）、`MINER_MODE`（old/new/both）、`MINER_USD`、`CLAIM_WIN`、`FLEX_DECISION`（灵活资金决策，默认 false）。更细的字段和原理见源码注释。

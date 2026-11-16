@@ -114,7 +114,8 @@ function makeEnsure(cfg) {
     info: () => { }, err: () => { }, errOnce: () => { }, warnOnce: () => { },
     formatError: (e) => e.message || String(e),
     roomLabel: () => '房间0',
-    sendTx: async (_inst, opt) => { approved = opt.args[1]; return true; }
+    sendTx: async (_inst, opt) => { approved = opt.args[1]; return true; },
+    tryFlexTopUp: async () => { }   // ensureFunds 现在会先尝试灵活资金决策(默认关闭=no-op)，测试里桩掉
   };
   const fn = new Function(...Object.keys(stubs), ensureSrc + '\nreturn ensureFunds;')(...Object.values(stubs));
   return { run: () => fn(inst, TICKET, 0), getApproved: () => approved };

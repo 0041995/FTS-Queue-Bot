@@ -35,13 +35,15 @@ const USDT_ADDR = process.env.FTS_USDT_ADDR || userCfg.USDT_ADDR || '0x55d398326
 const WATCH_ADDR = process.argv[3] || process.env.FTS_WATCH_ADDR || '';
 const CHAIN_ID = Number(process.env.FTS_CHAIN_ID || userCfg.CHAIN_ID || 56);
 const RPCS = (process.env.FTS_HTTP_POOL || (userCfg.HTTP_POOL || [
-  'https://bsc-dataseed1.binance.org',
-  'https://bsc-dataseed2.binance.org',
+  // 2026-11 实测可用，与 core 默认池保持一致
+  'https://bsc-dataseed.bnbchain.org',
+  'https://bsc-dataseed1.bnbchain.org',
+  'https://bsc-dataseed2.defibit.io',
   'https://bsc-rpc.publicnode.com',
-  'https://bsc-dataseed1.defibit.io',
-  'https://binance.llamarpc.com',
-  'https://1rpc.io/bnb',
-  'https://bsc.drpc.org'
+  'https://bsc.publicnode.com',
+  'https://bsc-mainnet.public.blastapi.io',
+  'https://bsc.blockrazor.xyz',
+  'https://bsc.meowrpc.com'
 ]).join(',')).split(',').map(s => s.trim()).filter(Boolean);
 
 const G = '\x1b[32m', R = '\x1b[31m', Y = '\x1b[33m', B = '\x1b[36m', D = '\x1b[0m';

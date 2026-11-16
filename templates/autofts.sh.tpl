@@ -354,6 +354,7 @@ wiz_load() {
       MINER_USD)        WIZ_MINER_USD="$v" ;;
       CLAIM_WIN)        if [ "$v" = "0" ]; then WIZ_CLAIM_WIN="0"; else WIZ_CLAIM_WIN="1"; fi ;;
       MINER_MODE)       case "$v" in old|new|both) WIZ_MINER_MODE="$v" ;; esac ;;
+      FLEX)             case "$v" in 1) WIZ_FLEX="1" ;; *) WIZ_FLEX="0" ;; esac ;;
       UPDATE_TOKEN)     WIZ_UPDATE_TOKEN="$v" ;;
     esac
   done < <(node -e '
@@ -374,6 +375,7 @@ wiz_load() {
     put("MINER_USD",c.MINER_USD);
     console.log("CLAIM_WIN="+(c.CLAIM_WIN===false||c.CLAIM_WIN===0||c.CLAIM_WIN==="0"||c.CLAIM_WIN==="false"?"0":"1"));
     put("MINER_MODE",c.MINER_MODE);
+    console.log("FLEX="+(c.FLEX_DECISION===true||c.FLEX_DECISION==="true"||c.FLEX_DECISION===1?"1":"0"));
   ' 2>/dev/null)
   # 兼容旧配置里 CLAIM_INTERVAL_MS 直接是毫秒
   [ -n "$WIZ_CLAIM" ] || WIZ_CLAIM=20
@@ -393,6 +395,7 @@ wiz_load() {
   case "$WIZ_MINER" in 0|1) ;; *) WIZ_MINER=0 ;; esac
   case "$WIZ_CLAIM_WIN" in 0|1) ;; *) WIZ_CLAIM_WIN=1 ;; esac
   case "$WIZ_MINER_MODE" in old|new|both) ;; *) WIZ_MINER_MODE=old ;; esac
+  case "$WIZ_FLEX" in 0|1) ;; *) WIZ_FLEX=0 ;; esac
   [[ "$WIZ_ROOMS" =~ ^[0-2](,[0-2])*$ ]] || WIZ_ROOMS="0,1,2"
 }
 
@@ -449,6 +452,7 @@ wiz_header() {
   echo "    最低 BNB   : ${WIZ_BNB}"
   echo "    组矿机     : $(wiz_miner_text)"
   echo "    中奖处理   : $(wiz_claimwin_text)"
+  echo "    灵活资金   : $(wiz_flex_text)"
   echo "    自动更新   : $(wiz_update_text)"
   echo "  ────────────────────────────────────────────────────"
 }
@@ -610,6 +614,23 @@ wiz_edit_miner() {
   fi
 }
 
+wiz_flex_text() {
+  if [ "$WIZ_FLEX" = "1" ]; then echo "开启"; else echo "关闭"; fi
+}
+
+wiz_edit_flex() {
+  local ch
+  wiz_header
+  echo "    ---- 灵活资金决策 ----"
+  echo "      开启后: 当某账号 USDT 或 BNB 不足以入场/组机时，"
+  echo "      自动从其余富余账号凑 USDT / 匀 BNB 完成本次操作(真实链上转账)。"
+  echo "      关闭(默认): 各账号独立，不足即跳过，不互相转钱。"
+  echo "    当前: $(wiz_flex_text)"
+  echo "      [1] 开启    [2] 关闭"
+  read -r -p "    请选择 [1/2]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  if [ "$ch" = "1" ]; then WIZ_FLEX="1"; else WIZ_FLEX="0"; fi
+}
+
 # ---- 推荐人自动检测(读链上 referrerOfV2) ----
 detect_referrer() {
   printf '%s' "$1" | node -e '
@@ -738,6 +759,7 @@ wiz_defaults() {
       WIZ_GAS_MODE="fixed"; WIZ_GAS_FIXED="0.05"; WIZ_GAS_MAX="10"; WIZ_GAS_MULT="1.25"
       WIZ_CLAIM="20"; WIZ_BNB="0.005"
       WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_MINER_MODE="old"; WIZ_CLAIM_WIN="1"
+      WIZ_FLEX="0"
       ok_msg "已恢复默认(尚未保存)" ;;
     *) echo "    已取消" ;;
   esac
@@ -755,6 +777,7 @@ wiz_commit() {
   WIZ_GAS_MODE="$WIZ_GAS_MODE" WIZ_GAS_FIXED="$WIZ_GAS_FIXED" WIZ_GAS_MAX="$WIZ_GAS_MAX" \
   WIZ_GAS_MULT="$WIZ_GAS_MULT" WIZ_CLAIM="$WIZ_CLAIM" WIZ_BNB="$WIZ_BNB" \
   WIZ_MINER="$WIZ_MINER" WIZ_MINER_USD="$WIZ_MINER_USD" WIZ_MINER_MODE="$WIZ_MINER_MODE" WIZ_CLAIM_WIN="$WIZ_CLAIM_WIN" \
+  WIZ_FLEX="$WIZ_FLEX" \
   WIZ_UPDATE_TOKEN="$WIZ_UPDATE_TOKEN" \
   node -e '
     const fs = require("fs");
@@ -775,6 +798,10 @@ wiz_commit() {
     c.MINER_USD = Number(e.WIZ_MINER_USD);
     c.MINER_MODE = String(e.WIZ_MINER_MODE || "old");
     c.CLAIM_WIN = String(e.WIZ_CLAIM_WIN) === "1";
+    c.FLEX_DECISION = String(e.WIZ_FLEX) === "1";
+    // 界面上只有一个"灵活资金决策"总开关，保存时同步两个子项，避免 config 里旧的 false 把总开关顶掉
+    c.FLEX_GAS_POOLING = c.FLEX_DECISION;
+    c.FLEX_FUND_AGGREGATION = c.FLEX_DECISION;
     c.UPDATE_TOKEN = String(e.WIZ_UPDATE_TOKEN || "").trim();
     c.AUTO_UPDATE = c.UPDATE_TOKEN.length > 0;
     const tmp = "config.json.tmp";
@@ -818,7 +845,8 @@ wiz_menu() {
   echo "      [5] 领取返利间隔      [6] 最低 BNB 余额"
   echo "      [7] 账号管理          [8] 恢复默认值"
   echo "      [9] 中奖处理/组矿机   [10] 自动更新"
-  echo "      [11] 保存并退出       [0] 不保存退出"
+  echo "      [11] 灵活资金决策     [12] 保存并退出"
+  echo "      [0] 不保存退出"
   echo "  ────────────────────────────────────────────────────"
 }
 
@@ -840,7 +868,8 @@ wizard_main() {
       8) wiz_defaults ;;
       9) wiz_edit_miner ;;
       10) wiz_edit_update ;;
-      11) if wiz_commit; then return 0; fi ;;
+      11) wiz_edit_flex ;;
+      12) if wiz_commit; then return 0; fi ;;
       0) echo ""; echo "  已退出，未做任何修改"; return 1 ;;
       *) ;;
     esac

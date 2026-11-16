@@ -105,17 +105,22 @@ const CFG = {
   HTTP_POOL: process.env.FTS_HTTP_POOL
     ? process.env.FTS_HTTP_POOL.split(',').map(s => s.trim()).filter(Boolean)
     : cfgArr(userCfg.HTTP_POOL, [
-      'https://bsc-dataseed1.binance.org',
-      'https://bsc-dataseed2.binance.org',
+      // 2026-11 实测可用(eth_chainId=0x38)；原 binance.org dataseed / llamarpc / 1rpc 等已不可用，移除。
+      'https://bsc-dataseed.bnbchain.org',
+      'https://bsc-dataseed1.bnbchain.org',
+      'https://bsc-dataseed2.defibit.io',
       'https://bsc-rpc.publicnode.com',
-      'https://bsc-dataseed1.defibit.io',
-      'https://binance.llamarpc.com',
-      'https://1rpc.io/bnb'
+      'https://bsc.publicnode.com',
+      'https://bsc-mainnet.public.blastapi.io',
+      'https://bsc.blockrazor.xyz',
+      'https://bsc.meowrpc.com'
     ], 'HTTP_POOL').map(s => String(s).trim()).filter(Boolean),
   WSS_POOL: process.env.FTS_WSS_POOL
     ? process.env.FTS_WSS_POOL.split(',').map(s => s.trim()).filter(Boolean)
     : cfgArr(userCfg.WSS_POOL, [
+      // 2026-11 实测可用；meowrpc/blastapi/blockrazor 的 WSS 不可用(405/403/非ws)，移除。
       'wss://bsc-rpc.publicnode.com',
+      'wss://bsc.publicnode.com',
       'wss://bsc.drpc.org'
     ], 'WSS_POOL').map(s => String(s).trim()).filter(Boolean),
 
@@ -199,7 +204,39 @@ const CFG = {
   RPC_MIN_SPACING_MS: cfgNum(process.env.FTS_RPC_SPACING_MS, 60, 'RPC_MIN_SPACING_MS'),
   ACCOUNT_STAGGER_MS: cfgNum(process.env.FTS_ACCOUNT_STAGGER_MS, 120, 'ACCOUNT_STAGGER_MS'),
   // 启动排水: 等上一轮未确认交易落地，避免重启后 nonce 回退
-  STARTUP_DRAIN_MS: cfgNum(process.env.FTS_DRAIN_MS, 30000, 'STARTUP_DRAIN_MS')
+  STARTUP_DRAIN_MS: cfgNum(process.env.FTS_DRAIN_MS, 30000, 'STARTUP_DRAIN_MS'),
+  // ---- 灵活资金决策(多账号互相匀 gas / 凑 USDT) ----
+  // 总开关，默认关闭：关闭时所有资金判断维持"单账号独立、不足即跳过"的原行为，零开销。
+  FLEX_ENABLED: (() => {
+    const raw = process.env.FTS_FLEX ?? userCfg.FLEX_DECISION;
+    if (raw === undefined || raw === null || raw === '') return false;
+    return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
+  })(),
+  // 匀开 gas: 某账号 BNB 不足以发交易时，从 BNB 富余的账号转入差额(真实链上转账)。默认关。
+  FLEX_GAS_POOLING: (() => {
+    const raw = process.env.FTS_FLEX_GAS ?? userCfg.FLEX_GAS_POOLING;
+    if (raw === undefined || raw === null || raw === '') {
+      // 未单独配置时跟随总开关(界面打开"灵活决策"即启用匀 gas)
+      const f = process.env.FTS_FLEX ?? userCfg.FLEX_DECISION;
+      if (f === undefined || f === null || f === '') return false;
+      return !(f === false || f === 0 || f === '0' || f === 'false' || f === 'off');
+    }
+    return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
+  })(),
+  // 凑 USDT: 各账号 USDT 单独都不够、但合计够一次入场时，从富余账号转入差额。默认关。
+  FLEX_FUND_AGGREGATION: (() => {
+    const raw = process.env.FTS_FLEX_FUND ?? userCfg.FLEX_FUND_AGGREGATION;
+    if (raw === undefined || raw === null || raw === '') {
+      // 未单独配置时跟随总开关(界面打开"灵活决策"即启用凑 USDT)
+      const f = process.env.FTS_FLEX ?? userCfg.FLEX_DECISION;
+      if (f === undefined || f === null || f === '') return false;
+      return !(f === false || f === 0 || f === '0' || f === 'false' || f === 'off');
+    }
+    return !(raw === false || raw === 0 || raw === 'false' || raw === 'off');
+  })(),
+  // donor 账号转入后自身至少保留的 USDT / BNB，避免把富余账号抽干
+  FLEX_DONOR_KEEP_USDT: cfgNum(process.env.FTS_FLEX_KEEP_USDT ?? userCfg.FLEX_DONOR_KEEP_USDT, 20, 'FLEX_DONOR_KEEP_USDT'),
+  FLEX_DONOR_KEEP_BNB: cfgNum(process.env.FTS_FLEX_KEEP_BNB ?? userCfg.FLEX_DONOR_KEEP_BNB, 0.01, 'FLEX_DONOR_KEEP_BNB')
 };
 
 // ---------------- 配置自检 ----------------
@@ -357,10 +394,17 @@ function rpcDetail(e) {
   walk(e.error, 0); walk(e.info, 0);
   return bits.join(' | ');
 }
-// "还没到能领的时候"的 revert: 不能标记为已领取，否则结算窗口一开就永远错过
+// "还没到能领的时候 / 暂时因资金或节点原因领不了"的 revert: 不能标记为已领取，
+// 否则结算窗口一开、或资金/gas 补上后就永远错过 —— 这正是"钱后来够了却没再领"的根因。
 function isTransientClaimRevert(e) {
   const t = (decodeRevert(e) || '') + ' ' + (e && (e.reason || e.shortMessage || e.message) || '') + ' ' + rpcDetail(e);
-  return /not refunding|vrf pending|not drawn|please wait|try again|still open/i.test(t);
+  return /not refunding|vrf pending|not drawn|please wait|try again|still open|not settled|not ended|not complete|round not|insufficient funds|insufficient balance|not enough|too early|not ready|window|gas too low|underpriced/i.test(t);
+}
+// 只有"明确是终态"的 revert 才允许永久标记为已领，避免把可恢复的失败误判为永久。
+// 拿不准(空 reason / 未知 revert)一律不算终态 -> 不标记，留给下一轮重试。
+function isTerminalClaimSkipReason(e) {
+  const t = (decodeRevert(e) || '') + ' ' + (e && (e.reason || e.shortMessage || e.message) || '') + ' ' + rpcDetail(e);
+  return /already claimed|already refunded|already paid|already received|not in round|not\s+(?:a\s+|the\s+)?winner|not eligible|no refund|nothing to claim|已经领|已领取|没有可领/i.test(t);
 }
 function isNetworkErr(e) {
   if (!e) return false;
@@ -411,6 +455,7 @@ const MINING_LEGACY_ABI = [
 const USDT_ABI = [
   'function allowance(address owner, address spender) view returns (uint256)',
   'function approve(address spender, uint256 amount) returns (bool)',
+  'function transfer(address to, uint256 amount) returns (bool)',
   'function balanceOf(address account) view returns (uint256)',
   'function decimals() view returns (uint8)',
   'function symbol() view returns (string)'
@@ -846,6 +891,73 @@ function roomLabel(room, ticketPrice) {
 }
 
 // ---------------- 资金与授权 ----------------
+// ---------------- 灵活资金决策(多账号互匀 gas / 凑 USDT) ----------------
+// 仅在 CFG.FLEX_ENABLED=true 时生效；关闭(默认)时立即返回，行为与现状完全一致。
+// 语义限制: 退款/空投只能由资格地址自己领(claim 退给 msg.sender)，脚本无法代领，
+// 因此"匀开/凑单"在这里实现为【从富余账号向本账号做真实链上转账】补 gas 或 USDT，
+// 转账本身的 gas 由 donor 承担。默认关闭，不开启不产生任何额外请求或交易。
+async function pickFlexDonor(inst, asset, shortWei) {
+  const keep = asset === 'bnb'
+    ? ethers.parseEther(String(CFG.FLEX_DONOR_KEEP_BNB))
+    : ethers.parseUnits(String(CFG.FLEX_DONOR_KEEP_USDT), 18);
+  let best = null, bestSlack = 0n;
+  for (const d of (typeof instances !== 'undefined' ? instances : [])) {
+    if (!d || String(d.address).toLowerCase() === String(inst.address).toLowerCase()) continue;
+    try {
+      const bal = asset === 'bnb'
+        ? await mgr.rpc(p => d.provider.getBalance(d.address))
+        : await mgr.rpc(p => d.usdt.balanceOf(d.address));
+      const slack = bal - keep - shortWei;   // 扣掉 donor 自身保留额与本次转账开销余量
+      if (slack > 0n && slack > bestSlack) { best = d; bestSlack = slack; }
+    } catch (e) { /* 该 donor 读失败，跳过 */ }
+  }
+  return best;
+}
+async function flexSendNative(fromInst, to, amtWei) {
+  const release = await fromInst.mutex.acquire();
+  try {
+    const fee = await buildFeeParams(1);
+    const nonce = await mgr.rpc(p => p.getTransactionCount(fromInst.address, 'pending'));
+    const tx = await withTimeout(fromInst.wallet.sendTransaction({ to, value: amtWei, gasLimit: 21000n, ...fee.tx }), 30000, 'flex-bnb');
+    info(fromInst.address, `[灵活决策] 转 BNB 给 ${to} 已广播 ${tx.hash} (nonce=${nonce})`);
+    try { await withTimeout(tx.wait(1, CFG.TX_WAIT_MS), CFG.TX_WAIT_MS + 10000, 'flex-bnb-wait'); } catch (e) { }
+    fromInst.nonce = null;
+    return true;
+  } catch (e) { warnOnce(fromInst.address, `[灵活决策] 转 BNB 失败: ${formatError(e)}`, 60000); return false; }
+  finally { release(); }
+}
+async function tryFlexTopUp(inst, needUsdtWei, needGasWei) {
+  if (!CFG.FLEX_ENABLED || DRY_RUN) return;
+  const needGas = needGasWei || 0n;
+  const needUsdt = needUsdtWei || 0n;
+  let bnbBal = 0n, usdtBal = 0n;
+  try {
+    [bnbBal, usdtBal] = await Promise.all([
+      mgr.rpc(p => inst.provider.getBalance(inst.address)),
+      needUsdt > 0n ? mgr.rpc(p => inst.usdt.balanceOf(inst.address)) : Promise.resolve(0n)
+    ]);
+  } catch (e) { return; }
+  // 1) gas 匀开: 本账号 BNB 不足以发交易 -> 找 BNB 富余的 donor 转入差额
+  if (CFG.FLEX_GAS_POOLING && needGas > 0n && bnbBal < needGas) {
+    const short = needGas - bnbBal;
+    const donor = await pickFlexDonor(inst, 'bnb', short);
+    if (donor) {
+      const amt = short + short / 5n;   // 多转 20% 覆盖 donor 这次转账的 gas 波动
+      info(inst.address, `[灵活决策] BNB 不足(${ethers.formatEther(bnbBal)})，从 ${donor.address} 匀 ${ethers.formatEther(amt)} 作 gas`);
+      await flexSendNative(donor, inst.address, amt);
+    } else warnOnce(inst.address, '[灵活决策] 需匀 gas 但无 BNB 富余账号', 120000);
+  }
+  // 2) USDT 凑单: 本账号 USDT 单独不够、但存在富余 donor -> 转入差额
+  if (CFG.FLEX_FUND_AGGREGATION && needUsdt > 0n && usdtBal < needUsdt) {
+    const short = needUsdt - usdtBal;
+    const donor = await pickFlexDonor(inst, 'usdt', short);
+    if (donor) {
+      info(inst.address, `[灵活决策] USDT 不足(${ethers.formatUnits(usdtBal, 18)}U)，从 ${donor.address} 凑 ${ethers.formatUnits(short, 18)}U`);
+      await sendTx(donor, { label: `[灵活决策] 转 USDT 给 ${inst.address}`, contract: donor.usdt, method: 'transfer', args: [inst.address, short] });
+    } else warnOnce(inst.address, '[灵活决策] 需凑 USDT 但无单账号富余可匀出(或均不足)', 120000);
+  }
+}
+
 async function ensureFunds(inst, ticketPrice, room) {
   const tag = roomLabel(room, ticketPrice);
   // 1) USDT 余额
@@ -858,8 +970,15 @@ async function ensureFunds(inst, ticketPrice, room) {
     return false;
   }
   if (bal < ticketPrice) {
-    errOnce(inst.address, `[${tag}] USDT 余额不足: 本轮需要 ${ethers.formatUnits(ticketPrice, 18)}，钱包当前 ${ethers.formatUnits(bal, 18)} -> 跳过本轮，不会发交易(已节流，60s 内不重复打印)`);
-    return false;
+    // 仅"报资金不足"时才触发灵活决策(默认关闭=no-op): 尝试从富余账号凑 USDT，补后重读
+    if (CFG.FLEX_ENABLED) {
+      await tryFlexTopUp(inst, ticketPrice, 0n);
+      try { bal = await mgr.rpc(p => inst.usdt.balanceOf(inst.address)); } catch (e) { }
+    }
+    if (bal < ticketPrice) {
+      errOnce(inst.address, `[${tag}] USDT 余额不足: 本轮需要 ${ethers.formatUnits(ticketPrice, 18)}，钱包当前 ${ethers.formatUnits(bal, 18)} -> 跳过本轮，不会发交易(已节流，60s 内不重复打印)`);
+      return false;
+    }
   }
   // 2) BNB gas 检查（60s 缓存: BNB 只用于付 gas，变化极慢，没必要每个块都查）
   try {
@@ -867,8 +986,16 @@ async function ensureFunds(inst, ticketPrice, room) {
     if (!inst.bnbCache || nowTs - inst.bnbCache.at > 60000) {
       inst.bnbCache = { at: nowTs, v: await mgr.rpc(p => inst.provider.getBalance(inst.address)) };
     }
+    const gasNeed = ethers.parseEther(String(CFG.MIN_BNB_GAS));
+    if (inst.bnbCache.v < gasNeed) {
+      // 仅 BNB(gas) 不足时才触发灵活决策(默认关闭=no-op): 从富余账号匀一笔，补后重读
+      if (CFG.FLEX_ENABLED) {
+        await tryFlexTopUp(inst, 0n, gasNeed);
+        inst.bnbCache = { at: Date.now(), v: await mgr.rpc(p => inst.provider.getBalance(inst.address)) };
+      }
+    }
     const bnb = inst.bnbCache.v;
-    if (bnb < ethers.parseEther(String(CFG.MIN_BNB_GAS))) {
+    if (bnb < gasNeed) {
       warnOnce(inst.address, `[${tag}] BNB 余额偏低(gas): ${ethers.formatEther(bnb)} BNB，建议保留 > ${CFG.MIN_BNB_GAS}，否则交易发不出去`);
     }
   } catch (e) { /* 非致命 */ }
@@ -1014,11 +1141,29 @@ function confirmTxInBackground(inst, tx, opt, nonce) {
       const reb = await rebroadcastSameNonce(inst, tx, nonce);
       if (reb) {
         warnOnce(inst.address, `${opt.label} 确认超时，已按同 nonce(${nonce}) 加价重播: ${reb}`, 30000);
+        // 关键: 重播也要盯最终结果。旧逻辑直接 return，若重播交易最终 revert，
+        // claimed 会一直挂着、这笔到游戏结束都不再领(漏领的第二个来源)。
+        try {
+          const rep = await withTimeout(inst.provider.waitForTransaction(reb, 1, CFG.TX_WAIT_MS), CFG.TX_WAIT_MS + 10000, 'replay-wait');
+          if (rep && rep.status === 1) {
+            if (opt.onConfirmed) { try { opt.onConfirmed(); } catch (x) { } }
+          } else {
+            inst.stats.failed++;
+            warnOnce(inst.address, `${opt.label} 重播交易上链失败(status=0): ${reb}`, 30000);
+            if (opt.onFailed) { try { opt.onFailed(); } catch (x) { } }
+          }
+        } catch (x) {
+          // 重播仍查不到结果: 交给 nonce 巡检 + 下轮预检重判，不臆断成功/失败
+          warnOnce(inst.address, `${opt.label} 重播确认仍超时: ${reb} -> 交下轮重扫`, 60000);
+        }
         return;
       }
       inst.stats.failed++;
       warnOnce(inst.address, `${opt.label} 确认超时: ${tx.hash} -> 已交给 nonce 巡检，稍后会自动补交易填坑`, 30000);
       if (opt.onFailed) { try { opt.onFailed(); } catch (e) { } }
+    } finally {
+      // noWait 领取在途计数归零(与 sendTx 广播成功时的 +1 配对)，供 isBusyForRestart 判断
+      inst.unconfirmed = Math.max(0, (inst.unconfirmed || 1) - 1);
     }
   })().catch(() => { });
 }
@@ -1158,6 +1303,7 @@ async function sendTx(inst, opt) {
           // 若等 90 秒 receipt，抢单雷达会在这期间完全瞎掉。
           // nonce 锁只在"广播"这一瞬间持有，确认交给后台，不会卡住抢单。
           inst.stats.sent++;
+          inst.unconfirmed = (inst.unconfirmed || 0) + 1;   // 在途计数，confirm 终态归零(见 isBusyForRestart)
           confirmTxInBackground(inst, tx, opt, nonce);
           return true;
         }
@@ -1461,10 +1607,11 @@ async function claimLoop(inst) {
             } catch (e) {
               canWin = false;
               const hardFail = e.code === 'CALL_EXCEPTION' || decodeRevert(e) !== null;
-              // 已领过 / 领取窗口过期(48h) 才永久跳过；网络抖动留待下次
-              if (hardFail && rec.state !== 0 && !isTransientClaimRevert(e)) inst.claimed.add(ck);
-              else if (hardFail && isTransientClaimRevert(e)) warnOnce(inst.address, `[房间${room}] 轮次${r} 中奖领取窗口未开，等下一次状态变化再试`, 120000);
-              else if (!hardFail) warnOnce(inst.address, `[房间${room}] 轮次${r} 中奖预检遇到网络问题，稍后重试: ${formatError(e).slice(0, 120)}`, 60000);
+              // 仅当 revert 明确是终态(already claimed / 不在本轮 / 非中奖者)才永久跳过；
+              // 窗口未开、资金不足、未知原因一律保留，等条件恢复后重试(否则钱到位也永远不领)。
+              if (hardFail && rec.state !== 0 && isTerminalClaimSkipReason(e)) inst.claimed.add(ck);
+              else if (hardFail) warnOnce(inst.address, `[房间${room}] 轮次${r} 中奖暂不可领(窗口/资金/未知)，保留稍后重试: ${formatError(e).slice(0, 120)}`, 120000);
+              else warnOnce(inst.address, `[房间${room}] 轮次${r} 中奖预检遇到网络问题，稍后重试: ${formatError(e).slice(0, 120)}`, 60000);
             }
             if (!canWin) continue;
             const okWin = await sendTx(inst, {
@@ -1497,9 +1644,11 @@ async function claimLoop(inst) {
               } catch (e2) {
                 claimable = false;
                 const hard2 = e2.code === 'CALL_EXCEPTION' || decodeRevert(e2) !== null;
-                if (hard2 && rec.state !== 0 && !isTransientClaimRevert(e2)) inst.claimed.add(ck);
-                else if (hard2 && isTransientClaimRevert(e2)) warnOnce(inst.address, `[房间${room}] 轮次${r} 退款窗口未开，等下一次状态变化再试`, 120000);
-                else if (!hard2) warnOnce(inst.address, `[房间${room}] 轮次${r} 退款预检遇到网络问题，稍后重试(不标记已领): ${formatError(e2).slice(0, 120)}`, 60000);
+                // 只有终态(already claimed / 不在本轮 / 无可退)才永久标记；
+                // 资金不足、窗口未开、未知 revert 全部保留，钱到位后重试 —— 修复漏领主因。
+                if (hard2 && rec.state !== 0 && isTerminalClaimSkipReason(e2)) inst.claimed.add(ck);
+                else if (hard2) warnOnce(inst.address, `[房间${room}] 轮次${r} 退款暂不可领(窗口/资金/未知)，保留稍后重试: ${formatError(e2).slice(0, 120)}`, 120000);
+                else warnOnce(inst.address, `[房间${room}] 轮次${r} 退款预检遇到网络问题，稍后重试(不标记已领): ${formatError(e2).slice(0, 120)}`, 60000);
               }
             }
           }
@@ -1584,11 +1733,20 @@ async function minerLoop(inst) {
         }
         // 老系统固定 MINER_USD；新版按当前额度实额支付
         const pay = t.fixed ? fixedUsd : BigInt(quota);
-        const [usdtBal, allowance, bnb] = await Promise.all([
+        let [usdtBal, allowance, bnb] = await Promise.all([
           mgr.rpc(p => inst.usdt.balanceOf(inst.address)),
           mgr.rpc(p => inst.usdt.allowance(inst.address, t.addr)),
           mgr.rpc(p => inst.provider.getBalance(inst.address))
         ]);
+        // 仅资金不足时才触发灵活决策(默认关闭=no-op): 凑 USDT / 匀 BNB，补后重读
+        if ((usdtBal < pay || bnb < minBnb) && CFG.FLEX_ENABLED) {
+          await tryFlexTopUp(inst, usdtBal < pay ? pay : 0n, bnb < minBnb ? minBnb : 0n);
+          [usdtBal, allowance, bnb] = await Promise.all([
+            mgr.rpc(p => inst.usdt.balanceOf(inst.address)),
+            mgr.rpc(p => inst.usdt.allowance(inst.address, t.addr)),
+            mgr.rpc(p => inst.provider.getBalance(inst.address))
+          ]);
+        }
         if (usdtBal < pay) {
           warnOnce(inst.address, `[矿机/${t.label}] USDT 不足: 需要 ${ethers.formatUnits(pay, 18)}U，当前 ${ethers.formatUnits(usdtBal, 18)}U，跳过`, 600000);
           continue;
@@ -1700,7 +1858,8 @@ function runUpdateCli(args) {
 }
 
 function isBusyForRestart() {
-  if (instances.some(i => (i.inflight || 0) > 0 || i.busy)) return true;
+  // unconfirmed>0: 有 noWait 领取已广播但后台确认未完成，此时重启会中断确认(虽可重扫自愈，但多烧 gas)，保守不重启
+  if (instances.some(i => (i.inflight || 0) > 0 || i.busy || (i.unconfirmed || 0) > 0)) return true;
   const rooms = sharedCache.rooms;
   if (!rooms) return true;                       // 状态还没读到，保守不重启
   const need = Math.max(5, CFG.SNIPE_MIN_COUNT - CFG.UPDATE_IDLE_MARGIN);

@@ -407,6 +407,7 @@ $Script:WizRooms = '0,1,2'; $Script:WizMin = '30'; $Script:WizMax = '60'; $Scrip
 $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
 $Script:WizClaim = '20'; $Script:WizBnb = '0.005'
 $Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizMinerMode = 'old'; $Script:WizClaimWin = '1'
+$Script:WizFlex = '0'
 $Script:WizUpdateToken = ''
 $Script:WizAccountCount = -1   # -1 = 未缓存；每次重绘都起 node 会明显卡顿
 $Script:WizAccountStamp = [datetime]::MinValue   # 缓存时 wallets.json 的 mtime
@@ -436,6 +437,7 @@ console.log("MINER_ENABLED="+(c.MINER_ENABLED===true||c.MINER_ENABLED==="true"||
 put("MINER_USD",c.MINER_USD);
 console.log("CLAIM_WIN="+(c.CLAIM_WIN===false||c.CLAIM_WIN===0||c.CLAIM_WIN==="0"||c.CLAIM_WIN==="false"?"0":"1"));
 put("MINER_MODE",c.MINER_MODE);
+console.log("FLEX="+(c.FLEX_DECISION===true||c.FLEX_DECISION==="true"||c.FLEX_DECISION===1?"1":"0"));
 '@
     $lines = Invoke-NodeJs 'cfg-read' $code
     foreach ($l in $lines) {
@@ -465,6 +467,7 @@ put("MINER_MODE",c.MINER_MODE);
                 'CLAIM_WIN'         { if ($v -eq '1') { $Script:WizClaimWin = '1' } else { $Script:WizClaimWin = '0' } }
                 'UPDATE_TOKEN'      { $Script:WizUpdateToken = $v }
                 'MINER_MODE'        { if ($v -in @('old','new','both')) { $Script:WizMinerMode = $v } }
+                'FLEX'              { if ($v -eq '1') { $Script:WizFlex = '1' } else { $Script:WizFlex = '0' } }
             }
         }
     }
@@ -528,6 +531,24 @@ function Edit-Update {
     Write-Ok "已保存 Token（仅写入本地 config.json）"
 }
 
+function Get-FlexText {
+    if ($Script:WizFlex -eq '1') { return '开(某账号 USDT/BNB 不足时，从富余账号凑转账)' }
+    return '关(各账号独立，不足即跳过)'
+}
+
+function Edit-Flex {
+    Show-WizHeader
+    Write-Host "    ---- 灵活资金决策 ----"
+    Write-Host "      开启后: 当某账号 USDT 或 BNB 不足以入场/组矿机时，"
+    Write-Host "      自动从其余富余账号凑 USDT / 匀 BNB 完成本次操作(真实链上转账)。"
+    Write-Host "      关闭(默认): 各账号独立，不足即跳过，不互相转钱。"
+    Write-Host "      注意: 只在报资金不足时才会触发，余额够时不做任何转账。"
+    Write-Host "    当前: $(Get-FlexText)"
+    Write-Host "      [1] 开启    [2] 关闭"
+    $ans = Read-Menu "    请选择 [1/2]"
+    if ($ans -eq '1') { $Script:WizFlex = '1' } else { $Script:WizFlex = '0' }
+}
+
 function Get-ClaimWinText {
     if ($Script:WizClaimWin -eq '1') { return '中奖后自动领取矿机额度' }
     return '中奖后不领取(放弃该奖励)'
@@ -563,6 +584,7 @@ function Show-WizHeader {
     Write-Host "    最低 BNB   : $($Script:WizBnb)"
     Write-Host "    组矿机     : $(Get-MinerText)"
     Write-Host "    中奖处理   : $(Get-ClaimWinText)"
+    Write-Host "    灵活资金   : $(Get-FlexText)"
     Write-Host "    自动更新   : $(Get-UpdateText)"
     Write-Host "  ----------------------------------------------------"
 }
@@ -849,6 +871,7 @@ function Reset-Defaults {
         $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
         $Script:WizClaim = '20'; $Script:WizBnb = '0.005'
         $Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizMinerMode = 'old'; $Script:WizClaimWin = '1'
+        $Script:WizFlex = '0'
         Write-Ok "已恢复默认(尚未保存)"
     } else {
         Write-Host "    已取消"
@@ -874,6 +897,7 @@ function Save-Wiz {
     $env:WIZ_MINER_USD = $Script:WizMinerUsd
     $env:WIZ_CLAIM_WIN = $Script:WizClaimWin
     $env:WIZ_MINER_MODE = $Script:WizMinerMode
+    $env:WIZ_FLEX = $Script:WizFlex
     $env:WIZ_UPDATE_TOKEN = $Script:WizUpdateToken
 
     $code = @'
@@ -894,6 +918,10 @@ c.MINER_ENABLED=String(e.WIZ_MINER)==="1";
 c.MINER_USD=Number(e.WIZ_MINER_USD);
 c.MINER_MODE=String(e.WIZ_MINER_MODE||"old");
 c.CLAIM_WIN=String(e.WIZ_CLAIM_WIN)==="1";
+c.FLEX_DECISION=String(e.WIZ_FLEX)==="1";
+// 界面上只有一个"灵活资金决策"总开关，保存时同步两个子项，避免 config 里旧的 false 把总开关顶掉
+c.FLEX_GAS_POOLING=c.FLEX_DECISION;
+c.FLEX_FUND_AGGREGATION=c.FLEX_DECISION;
 c.UPDATE_TOKEN=String(e.WIZ_UPDATE_TOKEN||"").trim();
 c.AUTO_UPDATE=c.UPDATE_TOKEN.length>0;
 const tmp="config.json.tmp";
@@ -902,7 +930,7 @@ try { fs.renameSync(tmp,"config.json"); } finally { if (fs.existsSync(tmp)) { tr
 '@
     $null = Invoke-NodeJs 'cfg-write' $code
     $rc = $Script:LastNodeExit
-    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_MINER_MODE','WIZ_CLAIM_WIN') {
+    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_MINER_MODE','WIZ_CLAIM_WIN','WIZ_FLEX') {
         Remove-Item "Env:$k" -ErrorAction SilentlyContinue
     }
     if ($rc -ne 0) { Write-WarnMsg "写入 config.json 失败"; Start-Sleep -Seconds 1; return $false }
@@ -945,7 +973,8 @@ function Invoke-Wizard {
         Write-Host "      [5] 领取返利间隔      [6] 最低 BNB 余额"
         Write-Host "      [7] 账号管理          [8] 恢复默认值"
         Write-Host "      [9] 中奖处理/组矿机   [10] 自动更新"
-        Write-Host "      [11] 保存并退出       [0] 不保存退出"
+        Write-Host "      [11] 灵活资金决策     [12] 保存并退出"
+        Write-Host "      [0] 不保存退出"
         Write-Host "  ----------------------------------------------------"
         $ch = Read-Menu "    请选择"
         switch ($ch) {
@@ -959,7 +988,8 @@ function Invoke-Wizard {
             '8' { Reset-Defaults }
             '9' { Edit-Miner }
             '10' { Edit-Update }
-            '11' { if (Save-Wiz) { return $true } }
+            '11' { Edit-Flex }
+            '12' { if (Save-Wiz) { return $true } }
             '0' { Write-Host ""; Write-Host "  已退出，未做任何修改"; return $false }
         }
     }
