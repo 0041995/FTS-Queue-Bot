@@ -5,6 +5,15 @@
  */
 
 // ---------------- 依赖检查 ----------------
+// 必须在 require('ethers') 之前替换全局 WebSocket：
+// Node 22+ 内置的 WebSocket 只有 addEventListener，没有 .on()，而 ethers 在
+// 模块加载时就把 getGlobal().WebSocket 存成了常量(_WebSocket)，之后再改全局已经无效。
+try {
+  const __ws = require('ws');
+  const __WS = __ws.WebSocket || __ws;
+  if (__WS && __WS.prototype && typeof __WS.prototype.on === 'function') globalThis.WebSocket = __WS;
+} catch (e) { /* 没装 ws: 后面会退回 HTTP 轮询 */ }
+
 let ethers;
 try {
   ethers = require('ethers');
@@ -321,6 +330,28 @@ function formatError(e) {
   if (e.info && e.info.error && e.info.error.message) parts.push('rpc=' + String(e.info.error.message).slice(0, 200));
   return parts.join(' | ');
 }
+function rpcDetail(e) {
+  if (!e) return '';
+  const bits = [];
+  const push = v => { if (v && typeof v === 'string' && bits.length < 10) bits.push(v); };
+  push(e.shortMessage); push(e.reason); push(e.message);
+  const walk = (o, depth) => {
+    if (!o || typeof o !== 'object' || depth > 3) return;
+    if (o.message) push(o.message);
+    if (o.code !== undefined) push(String(o.code));
+    if (o.error) walk(o.error, depth + 1);
+    if (o.info) walk(o.info, depth + 1);
+  };
+  walk(e.error, 0); walk(e.info, 0);
+  return bits.join(' | ');
+}
+// 网络/DNS/限流这类"不是合约拒绝"的错误: 只能换节点重试，绝不能标记成已领取
+function isNetworkErr(e) {
+  if (!e) return false;
+  if (['NETWORK_ERROR', 'TIMEOUT', 'SERVER_ERROR'].includes(e.code)) return true;
+  const s = rpcDetail(e);
+  return /ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|fetch failed|socket hang up|could not coalesce|429|too many requests|rate limit/i.test(s);
+}
 // console.log 写管道是异步的，直接 process.exit 可能在 flush 前退出、把最后几行截掉
 // (重定向到文件时尤其明显)。这里等 stdout 排空再退，exitCode 先设好兜底。
 function exitFlush(code) {
@@ -414,6 +445,7 @@ class RpcManager {
     this.failStreak = 0;
     this.listeners = [];
     this.stats429 = 0;
+    this.rotating = null;   // 换节点去重: 并发的 rotate() 共用同一次探测结果
   }
   onRotate(fn) { this.listeners.push(fn); }
   makeProvider(url) {
@@ -447,6 +479,14 @@ class RpcManager {
     return this.provider;
   }
   async rotate() {
+    // 多账号/多循环可能同时触发换节点: 合并成一次探测，避免同一 URL 被并发打 4 次、日志刷屏
+    if (this.rotating) return this.rotating;
+    this.rotating = this._rotate()
+      .catch(e => { warnOnce('SYS', '切换节点异常: ' + formatError(e), 60000); return false; })
+      .finally(() => { this.rotating = null; });
+    return this.rotating;
+  }
+  async _rotate() {
     const old = this.urls[this.index];
     // 第一轮优先跳过处于冷却期的节点
     for (let pass = 0; pass < 2; pass++) {
@@ -455,7 +495,7 @@ class RpcManager {
       const left = cooldownLeft(this.urls[idx]);
       if (pass === 0 && left > 0) continue;   // 冷却中，先试别的
       const r = await this.probe(this.urls[idx]);
-      if (!r.ok) err('SYS', `备用节点探测失败 ${this.urls[idx]}: ${formatError(r.error)}`);
+      if (!r.ok) warnOnce('SYS', `备用节点不可用 ${this.urls[idx]}: ${formatError(r.error)}`, 60000);
       if (r.ok) {
         this.index = idx;
         this.provider = this.makeProvider(this.urls[idx]);
@@ -590,6 +630,7 @@ class BlockStream {
     this.isReconnecting = false;  // 防止同时连出多条 WebSocket(幽灵连接)
     this.connecting = false;
     this.wsErrAt = 0;
+    this.pollFailStreak = 0;
   }
   start() {
     if (ensureWebSocket()) this.connectWs(); else warn('SYS', 'WS 不可用，直接进入轮询模式');
@@ -627,14 +668,14 @@ class BlockStream {
         clearTimeout(guard);
         this.connecting = false;
         this.wsOk = false;
-        warn('SYS', 'WebSocket 断开，准备重连');
+        warnOnce('SYS', 'WebSocket 断开，准备重连', 30000);
         this.scheduleReconnect();
       });
       provider.websocket.on('error', (e) => {
         clearTimeout(guard);
         this.connecting = false;
         const m = (e && (e.message || e.type)) || 'unknown';
-        err('SYS', `WebSocket 错误: ${m}`);
+        warnOnce('SYS', `WebSocket 错误(${url}): ${m}`, 30000);
       });
       // ethers v6 的 JsonRpcApiProvider 会在内部请求失败时 emit('error')。
       // EventEmitter 上如果没有 'error' 监听者，Node 会直接抛 ERR_UNHANDLED_ERROR，
@@ -675,6 +716,7 @@ class BlockStream {
       while (!this.stopped) {
         try {
           const h = await mgr.rpc(p => withTimeout(p.getBlockNumber(), 8000, 'poll'));
+          this.pollFailStreak = 0;
           // 块号变了就交给 tick，去重在 tick 里按块号做(不再靠时间窗判断)
           if (h > this.lastHeight) {
             this.lastHeight = h;
@@ -682,12 +724,17 @@ class BlockStream {
             this.tick(h, 'poll');
           }
         } catch (e) {
-          errOnce('SYS', '轮询获取区块失败: ' + formatError(e), 30000);
+          this.pollFailStreak++;
+          // 连续失败就换节点并放慢轮询，避免 DNS 掉线时每 1.5s 刷一条错误
+          if (this.pollFailStreak >= 2) await mgr.rotate();
+          const backoff = Math.min(1000 * this.pollFailStreak, 15000);
+          errOnce('SYS', '轮询获取区块失败: ' + formatError(e), 60000);
+          await sleep(backoff);
         }
         await sleep(CFG.POLL_INTERVAL_MS);
       }
     };
-    loop();
+    loop().catch(e => warnOnce('SYS', '轮询循环异常: ' + formatError(e), 60000));
   }
   startWatchdog() {
     setInterval(() => {
@@ -713,7 +760,7 @@ class BlockStream {
     if (this.pendingBlocks.length > 50) this.pendingBlocks.splice(0, this.pendingBlocks.length - 50);
 
     if (this.ticking) return;  // 正在处理，新块排队等下一轮自动补跑
-    this.runQueue();
+    this.runQueue().catch(e => warnOnce('SYS', '区块处理队列异常: ' + formatError(e), 30000));
   }
 
   async runQueue() {
@@ -766,7 +813,7 @@ class BlockStream {
     } finally {
       this.ticking = false;
       // 收尾时又来新块则再跑一轮，避免遗漏
-      if (this.pendingBlocks.length && !this.stopped) this.runQueue();
+      if (this.pendingBlocks.length && !this.stopped) this.runQueue().catch(e => warnOnce('SYS', '区块处理队列异常: ' + formatError(e), 30000));
     }
   }
 }
@@ -1054,10 +1101,16 @@ async function sendTx(inst, opt) {
           // 业务 revert(人数已满/已入场/不在轮次) 很常见，直接放弃这一轮；
           // 但节点抖动导致的 estimateGas 失败不该白白浪费抢单窗口，重试一次
           const c = e.code || '';
-          if (attempt === 1 && ['NETWORK_ERROR', 'SERVER_ERROR', 'TIMEOUT'].includes(c)) {
+          if (attempt === 1 && isNetworkErr(e)) {
             warnOnce(inst.address, `${opt.label} 预检遇到网络问题，换节点重试一次: ${formatError(e).slice(0, 120)}`, 30000);
             await mgr.rotate();
             continue;
+          }
+          // 业务状态(precheck revert)不是故障: 已入场/已满/今日场次用完/已领取等，降级为提醒
+          const rv = `${decodeRevert(e) || ''} ${rpcDetail(e)}`;
+          if (/already joined|full|capacity|daily round limit|already claimed|not in round|not refunding|not winner|window|已经|已满/i.test(rv)) {
+            warnOnce(inst.address, `${opt.label} 预检未通过(业务状态，正常): ${formatError(e).slice(0, 140)}`, 60000);
+            return false;
           }
           errOnce(inst.address, `${opt.label} 预检失败(不会上链): ${formatError(e)}`, 15000);
           return false;
@@ -1142,6 +1195,30 @@ async function sendTx(inst, opt) {
           // attemptNonce 保留: 第一次很可能已经广播进 mempool 了，
           // attempt 2 应该用同一 nonce 加价替换，而不是再发一笔 N+1
           warn(inst.address, `${opt.label} 网络异常(${c})，切换节点重试(${attempt}/2): ${formatError(e)}`);
+          await mgr.rotate();
+          await sleep(800);
+          continue;
+        }
+        // ethers 对节点返回的非标准错误统一包成 UNKNOWN_ERROR("could not coalesce error")，
+        // 里面可能藏着 "already known"(重复广播) / 429 / ENOTFOUND / revert，必须拆开分别处理。
+        const detail = rpcDetail(e);
+        if (c === 'UNKNOWN_ERROR' || /could not coalesce/i.test(e.message || '')) {
+          if (/already known|known transaction|already imported|already exists|nonce too low/i.test(detail)) {
+            ok(inst.address, `${opt.label} 已在内存池/链上(重复广播)，按成功处理`);
+            inst.stats.sent++;
+            return true;
+          }
+          if (/insufficient funds|insufficient balance/i.test(detail)) {
+            err(inst.address, `${opt.label} BNB 不足以支付 gas: ${detail.slice(0, 160)}`);
+            inst.nonce = null;
+            return false;
+          }
+          if (/execution reverted/i.test(detail)) {
+            err(inst.address, `${opt.label} 合约调用失败(revert): ${detail.slice(0, 160)}`);
+            inst.nonce = null;
+            return false;
+          }
+          warn(inst.address, `${opt.label} 节点返回异常，切换节点重试(${attempt}/2): ${detail.slice(0, 160)}`);
           await mgr.rotate();
           await sleep(800);
           continue;
@@ -1318,19 +1395,38 @@ async function claimLoop(inst) {
   while (true) {
     try {
       for (const room of CFG.ROOMS) {
-        const rId = Number(await mgr.rpc(p => inst.queue.currentRound(room)));
+        let rId = NaN;
+        try {
+          rId = Number(await mgr.rpc(p => inst.queue.currentRound(room)));
+        } catch (e) {
+          // 读当前轮次失败(多半是 DNS/网络抖动)不能让整个领取流程中断，
+          // 否则一个房间失败会把其他房间该领的钱也一起拖没。
+          if (isNetworkErr(e)) warnOnce(inst.address, `[房间${room}] 读取当前轮次失败(网络)，本轮跳过稍后重试: ${formatError(e).slice(0, 120)}`, 60000);
+          else err(inst.address, `[房间${room}] 读取当前轮次失败: ${formatError(e)}`);
+          continue;
+        }
+        if (!Number.isFinite(rId)) continue;
         const start = Math.max(0, rId - CFG.CLAIM_LOOKBACK);
         // 重要: 不再用 state === 2 过滤。进行中(state 0)的轮次同样可能允许退款，
         // 只按 "本轮有人(count>0) 且 我不是中奖者" 粗筛，能不能领一律交给
         // staticCall 预检决定 —— 这样才不会漏掉任何一笔退款。
         // 注意用 <= : 当前轮次(rId)也要扫。
+        let netErrs = 0;
         for (let r = start; r <= rId; r++) {
           const ck = `${room}:${r}`;
           // 已处理过的轮次直接跳过，连 roundInfo 都不查 —— 这是省掉绝大部分请求的关键
           if (inst.claimed.has(ck)) continue;
           let rec;
           try { rec = await getRoundInfo(inst, room, r); }
-          catch (e) { continue; }               // 单轮读取失败不影响其他轮次
+          catch (e) {
+            // 网络断了就别硬扫剩下的几十轮了，换节点、本轮房间直接跳过
+            if (isNetworkErr(e)) {
+              netErrs++;
+              if (netErrs >= 2) { warnOnce(inst.address, `[房间${room}] 连续读取轮次失败(网络)，本轮跳过`, 60000); break; }
+            }
+            continue;
+          }
+          netErrs = 0;
           if (rec.count <= 0) continue;         // 空轮次，无人可退
           const isWinner = rec.winners.includes(inst.address.toLowerCase());
 
@@ -1402,12 +1498,18 @@ async function claimLoop(inst) {
             onFailed: () => { inst.claimed.delete(ck); }  // 上链失败就撤标记，下轮重试
           });
           if (okTx) inst.claimed.add(ck);
-          else errOnce(inst.address, `[房间${room}] 轮次${r} 预检通过但广播失败，下一轮会重试。排查: 该轮是否已过期/已被他人结算`, 30000);
+          else errOnce(inst.address, `[房间${room}] 轮次${r} 预检通过但广播未成功，已保留标记会在下一轮重试(不会漏领)`, 60000);
         }
       }
     } catch (e) {
-      err(inst.address, '领取流程异常: ' + formatError(e));
-      err(inst.address, '领取流程排查: currentRound/roundInfo 是否为预期格式; 合约地址或房间号是否变更');
+      if (isNetworkErr(e)) {
+        // DNS 掉线/节点全挂: 属于网络层问题，换节点后继续，不要用"合约变了"误导排查
+        warnOnce(inst.address, '领取流程遇到网络问题，已换节点，稍后自动重试: ' + formatError(e), 60000);
+        await mgr.rotate();
+      } else {
+        err(inst.address, '领取流程异常: ' + formatError(e));
+        errOnce(inst.address, '领取流程排查: currentRound/roundInfo 是否为预期格式; 合约地址或房间号是否变更', 60000);
+      }
     }
     if (inst.claimed.size > 500) inst.claimed = new Set([...inst.claimed].slice(-200));
     await sleep(CFG.CLAIM_INTERVAL_MS + Math.random() * 5000);
@@ -1862,7 +1964,11 @@ async function main() {
       exitFlush(24);
     }
   });
-  process.on('unhandledRejection', e => { err('SYS', '未处理Promise拒绝: ' + formatError(e && e.message ? e.message : String(e))); });
+  process.on('unhandledRejection', e => {
+    const d = formatError(e);
+    if (isNetworkErr(e)) warnOnce('SYS', '网络类 Promise 拒绝(已忽略，会自动重试): ' + d, 60000);
+    else errOnce('SYS', '未处理 Promise 拒绝: ' + d, 60000);
+  });
 }
 
 main().catch(e => { fatal('SYS', '主流程致命错误: ' + formatError(e)); exitFlush(23); });
