@@ -151,10 +151,11 @@ function Show-Usage {
   SNIPE_MIN_COUNT / SNIPE_MAX_COUNT  抢单人数区间，默认 30/60
   SNIPE_DELAY_MS     抢单延迟(毫秒)，默认 0
   GAS_GWEI           固定 gas 价，默认 0.05；写 null 则改为自动(按链上价 x GAS_MULT)
-  CLAIM_INTERVAL_MS  领取返利扫描间隔，默认 30000
+  CLAIM_INTERVAL_MS  领取返利扫描间隔，默认 20000
   MIN_BNB_GAS        最低 BNB 提醒阈值，默认 0.005
   MINING_CLAIM_MS    矿机产出领取扫描间隔，默认 45000（只要可领就立刻领）
   MINER_ENABLED      是否自动组矿机；MINER_MODE=old/new/both
+  UPDATE_TOKEN       自动更新用的 GitHub 只读 token（在 --init 里配置）
 '@
     exit 0
 }
@@ -417,8 +418,9 @@ if ($Mode -eq 'run' -or $Mode -eq 'dry-run') {
 
 $Script:WizRooms = '0,1,2'; $Script:WizMin = '30'; $Script:WizMax = '60'; $Script:WizDelay = '0'
 $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
-$Script:WizClaim = '30'; $Script:WizBnb = '0.005'
+$Script:WizClaim = '20'; $Script:WizBnb = '0.005'
 $Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizMinerMode = 'old'; $Script:WizClaimWin = '1'
+$Script:WizUpdateToken = ''
 $Script:WizAccountCount = -1   # -1 = 未缓存；每次重绘都起 node 会明显卡顿
 $Script:WizAccountStamp = [datetime]::MinValue   # 缓存时 wallets.json 的 mtime
 
@@ -474,6 +476,7 @@ put("MINER_MODE",c.MINER_MODE);
                 'MINER_ENABLED'     { if ($v -eq '1') { $Script:WizMiner = '1' } else { $Script:WizMiner = '0' } }
                 'MINER_USD'         { if (Test-IsNum $v) { $Script:WizMinerUsd = $v } }
                 'CLAIM_WIN'         { if ($v -eq '1') { $Script:WizClaimWin = '1' } else { $Script:WizClaimWin = '0' } }
+                'UPDATE_TOKEN'      { $Script:WizUpdateToken = $v }
                 'MINER_MODE'        { if ($v -in @('old','new','both')) { $Script:WizMinerMode = $v } }
             }
         }
@@ -508,6 +511,34 @@ function Get-MinerText {
         'both' { return "开(新版按额度 + 老系统固定 $($Script:WizMinerUsd) USDT)" }
         default { return "开(老系统: 固定付 $($Script:WizMinerUsd) USDT)" }
     }
+}
+
+function Get-UpdateText {
+    if ([string]::IsNullOrWhiteSpace($Script:WizUpdateToken)) { return '未配置（私有仓库不会自动更新）' }
+    $t = $Script:WizUpdateToken
+    if ($t.Length -gt 10) { return "已配置（" + $t.Substring(0, 4) + "****" + $t.Substring($t.Length - 4) + "）" }
+    return '已配置'
+}
+
+function Edit-Update {
+    Show-WizHeader
+    Write-Host "    ---- 自动更新（GitHub 只读 Token）----"
+    Write-Host "      仓库是私有的，需要 GitHub token（Fine-grained: Contents = Read）"
+    Write-Host "      直接回车 = 保持当前；输入 - = 清除并关闭自动更新"
+    Write-Host "    当前: $(Get-UpdateText)"
+    if ([Console]::IsInputRedirected) {
+        $tok = "$(Read-Host '    粘贴 Token')".Trim()
+    } else {
+        $sec = Read-Host "    粘贴 Token (输入不显示)" -AsSecureString
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+        try { $tok = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+        $tok = "$tok".Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($tok)) { return }
+    if ($tok -eq '-') { $Script:WizUpdateToken = ''; Write-Ok "已清除 Token（自动更新关闭）"; return }
+    if ($tok -notmatch '^(gh[pousr]_\w+|github_pat_\w+)$') { Write-WarnMsg "看起来不像 GitHub token，仍按输入保存" }
+    $Script:WizUpdateToken = $tok
+    Write-Ok "已保存 Token（仅写入本地 config.json）"
 }
 
 function Get-ClaimWinText {
@@ -545,6 +576,7 @@ function Show-WizHeader {
     Write-Host "    最低 BNB   : $($Script:WizBnb)"
     Write-Host "    组矿机     : $(Get-MinerText)"
     Write-Host "    中奖处理   : $(Get-ClaimWinText)"
+    Write-Host "    自动更新   : $(Get-UpdateText)"
     Write-Host "  ----------------------------------------------------"
 }
 
@@ -828,7 +860,7 @@ function Reset-Defaults {
     if ($a -match '^[Yy]') {
         $Script:WizRooms = '0,1,2'; $Script:WizMin = '30'; $Script:WizMax = '60'; $Script:WizDelay = '0'
         $Script:WizGasMode = 'fixed'; $Script:WizGasFixed = '0.05'; $Script:WizGasMax = '10'; $Script:WizGasMult = '1.25'
-        $Script:WizClaim = '30'; $Script:WizBnb = '0.005'
+        $Script:WizClaim = '20'; $Script:WizBnb = '0.005'
         $Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizMinerMode = 'old'; $Script:WizClaimWin = '1'
         Write-Ok "已恢复默认(尚未保存)"
     } else {
@@ -855,6 +887,7 @@ function Save-Wiz {
     $env:WIZ_MINER_USD = $Script:WizMinerUsd
     $env:WIZ_CLAIM_WIN = $Script:WizClaimWin
     $env:WIZ_MINER_MODE = $Script:WizMinerMode
+    $env:WIZ_UPDATE_TOKEN = $Script:WizUpdateToken
 
     $code = @'
 const fs=require("fs");
@@ -874,6 +907,8 @@ c.MINER_ENABLED=String(e.WIZ_MINER)==="1";
 c.MINER_USD=Number(e.WIZ_MINER_USD);
 c.MINER_MODE=String(e.WIZ_MINER_MODE||"old");
 c.CLAIM_WIN=String(e.WIZ_CLAIM_WIN)==="1";
+c.UPDATE_TOKEN=String(e.WIZ_UPDATE_TOKEN||"").trim();
+c.AUTO_UPDATE=c.UPDATE_TOKEN.length>0;
 const tmp="config.json.tmp";
 fs.writeFileSync(tmp,JSON.stringify(c,null,2)+"\n");
 try { fs.renameSync(tmp,"config.json"); } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch(e){} } }
@@ -922,8 +957,8 @@ function Invoke-Wizard {
         Write-Host "      [3] 抢单延迟          [4] 手续费 / Gas"
         Write-Host "      [5] 领取返利间隔      [6] 最低 BNB 余额"
         Write-Host "      [7] 账号管理          [8] 恢复默认值"
-        Write-Host "      [9] 中奖处理/组矿机   [10] 保存并退出"
-        Write-Host "      [0] 不保存退出"
+        Write-Host "      [9] 中奖处理/组矿机   [10] 自动更新"
+        Write-Host "      [11] 保存并退出       [0] 不保存退出"
         Write-Host "  ----------------------------------------------------"
         $ch = Read-Menu "    请选择"
         switch ($ch) {
@@ -936,7 +971,8 @@ function Invoke-Wizard {
             '7' { Show-Accounts }
             '8' { Reset-Defaults }
             '9' { Edit-Miner }
-            '10' { if (Save-Wiz) { return $true } }
+            '10' { Edit-Update }
+            '11' { if (Save-Wiz) { return $true } }
             '0' { Write-Host ""; Write-Host "  已退出，未做任何修改"; return $false }
         }
     }

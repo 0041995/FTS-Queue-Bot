@@ -119,7 +119,7 @@ const CFG = {
   SNIPE_MIN_COUNT: cfgNum(process.env.FTS_MIN_COUNT ?? userCfg.SNIPE_MIN_COUNT, 30, 'SNIPE_MIN_COUNT'),
   SNIPE_MAX_COUNT: cfgNum(process.env.FTS_MAX_COUNT ?? userCfg.SNIPE_MAX_COUNT, 60, 'SNIPE_MAX_COUNT'),
   SNIPE_DELAY_MS: cfgNum(process.env.FTS_DELAY_MS ?? userCfg.SNIPE_DELAY_MS, 0, 'SNIPE_DELAY_MS'),
-  CLAIM_INTERVAL_MS: cfgNum(process.env.FTS_CLAIM_MS ?? userCfg.CLAIM_INTERVAL_MS, 30000, 'CLAIM_INTERVAL_MS'),
+  CLAIM_INTERVAL_MS: cfgNum(process.env.FTS_CLAIM_MS ?? userCfg.CLAIM_INTERVAL_MS, 20000, 'CLAIM_INTERVAL_MS'),
   CLAIM_LOOKBACK: cfgNum(process.env.FTS_CLAIM_LOOKBACK ?? userCfg.CLAIM_LOOKBACK, 20, 'CLAIM_LOOKBACK'),
   POLL_INTERVAL_MS: cfgNum(process.env.FTS_POLL_MS ?? userCfg.POLL_INTERVAL_MS, 1500, 'POLL_INTERVAL_MS'),
   WS_STALE_MS: cfgNum(process.env.FTS_WS_STALE_MS ?? userCfg.WS_STALE_MS, 45000, 'WS_STALE_MS'),
@@ -181,15 +181,6 @@ const CFG = {
     return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
   })(),
   MINING_CLAIM_MS: cfgNum(process.env.FTS_MINING_CLAIM_MS ?? userCfg.MINING_CLAIM_MS, 45000, 'MINING_CLAIM_MS'),
-  // ---- 领取触发 ----
-  // 链上没有"你有退款了"的推送事件，能做到的最快方式是盯出块+轮次状态变化:
-  // 一轮一结算就立刻触发领取，而不是等下一个 30 秒定时器。
-  CLAIM_KICK: (() => {
-    const raw = process.env.FTS_CLAIM_KICK ?? userCfg.CLAIM_KICK;
-    if (raw === undefined || raw === null || raw === '') return true;
-    return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
-  })(),
-  CLAIM_MIN_GAP_MS: cfgNum(process.env.FTS_CLAIM_MIN_GAP_MS ?? userCfg.CLAIM_MIN_GAP_MS, 4000, 'CLAIM_MIN_GAP_MS'),
   MIN_BNB_GAS: cfgNum(process.env.FTS_MIN_BNB ?? userCfg.MIN_BNB_GAS, 0.005, 'MIN_BNB_GAS'),
   // nonce 断档自愈: 发现"有在途交易但 latest 长期不动"就补一笔自转填坑
   GAP_CHECK_MS: cfgNum(process.env.FTS_GAP_CHECK_MS, 20000, 'GAP_CHECK_MS'),
@@ -266,7 +257,6 @@ function validateCfg() {
     CFG.MINER_MODE = 'old';
   }
   if (CFG.MINING_CLAIM_MS < 15000) { p.push('MINING_CLAIM_MS 太小，已改为 15000'); CFG.MINING_CLAIM_MS = 15000; }
-  if (CFG.CLAIM_MIN_GAP_MS < 1000) { p.push('CLAIM_MIN_GAP_MS 太小，已改为 1000'); CFG.CLAIM_MIN_GAP_MS = 1000; }
   return p.concat(cfgProblems);
 }
 
@@ -1266,15 +1256,6 @@ async function getRoomCfg(room) {
   if (cfg) roomCfgCache.set(room, { at: Date.now(), cfg });
   return cfg;
 }
-// 轮次状态变化即触发领取: 每出一块都会读一次当前轮的 state，
-// 0(进行中) -> 非0(结算/退款) 或轮次号前进，就立刻叫醒所有账号的领取循环。
-const lastRoomState = new Map();
-function kickClaims(room, rId, state, prev) {
-  if (!CFG.CLAIM_KICK || !instances.length) return;
-  for (const inst of instances) inst.claimKick = true;
-  info('SYS', `[领取触发] 房间${room} 轮次${rId} 状态 ${prev ? prev.state : '-'}→${state}，立即检查可领取`);
-}
-
 async function getSharedState(height) {
   if (sharedCache.rooms && sharedCache.height === height && Date.now() - sharedCache.at < 3000) return sharedCache.rooms;
   if (!readQueue) bindRead(mgr.provider);
@@ -1308,15 +1289,6 @@ async function getSharedState(height) {
   }));
   const rooms = {};
   for (const p of pairs) if (p) rooms[p[0]] = p[1];
-  // 结算触发: 轮次号变了，或本轮从"进行中"变成"已结算/退款"
-  for (const k of Object.keys(rooms)) {
-    const room = Number(k), st = rooms[k];
-    const prev = lastRoomState.get(room);
-    if (prev && (prev.rId !== st.rId || prev.state !== st.state)) {
-      kickClaims(room, st.rId, st.state, prev);
-    }
-    lastRoomState.set(room, { rId: st.rId, state: st.state });
-  }
   // 一个房间都没读出来就别写缓存，否则接下来 3 秒会一直返回"空状态"
   if (Object.keys(rooms).length) {
     sharedCache.height = height; sharedCache.at = Date.now(); sharedCache.rooms = rooms;
@@ -1425,10 +1397,6 @@ async function getRoundInfo(inst, room, r) {
 
 async function claimLoop(inst) {
   while (true) {
-    // 与上次扫描至少间隔一会儿: 结算连续触发时不至于把节点打爆
-    const gap = Date.now() - (inst.lastClaimScan || 0);
-    if (gap < CFG.CLAIM_MIN_GAP_MS) await sleep(CFG.CLAIM_MIN_GAP_MS - gap);
-    inst.claimKick = false;   // 先清标记: 扫描期间新到的结算仍然能在下一轮唤醒
     try {
       for (const room of CFG.ROOMS) {
         let rId = NaN;
@@ -1550,13 +1518,8 @@ async function claimLoop(inst) {
       }
     }
     if (inst.claimed.size > 500) inst.claimed = new Set([...inst.claimed].slice(-200));
-    inst.lastClaimScan = Date.now();
-    // 平时按 CLAIM_INTERVAL_MS 轮询；一旦有"本轮结算"的 kick，最多 1 秒内就醒
-    const limit = CFG.CLAIM_INTERVAL_MS + Math.random() * 5000;
-    const t0 = Date.now();
-    while (Date.now() - t0 < limit && !inst.claimKick) {
-      await sleep(Math.max(200, Math.min(1000, limit - (Date.now() - t0))));
-    }
+    // 纯定时扫描: 默认 20 秒一轮，随机抖动避免多账号同时打节点
+    await sleep(CFG.CLAIM_INTERVAL_MS + Math.random() * 5000);
   }
 }
 
@@ -1960,7 +1923,6 @@ async function main() {
       delayMs: num(w.SNIPE_DELAY_MS, CFG.SNIPE_DELAY_MS),
       mutex: new (class { constructor() { this.q = Promise.resolve(); } async acquire() { let rel; const next = new Promise(r => rel = r); const prev = this.q; this.q = this.q.then(() => next); await prev; return rel; } })(),
       acted: new Set(), claimed: new Set(), nonce: null, busy: false,
-      claimKick: false, lastClaimScan: 0,
       bnbCache: null,
       stats: { sent: 0, failed: 0 }
     };

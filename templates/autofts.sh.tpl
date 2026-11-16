@@ -47,9 +47,10 @@ usage() {
   SNIPE_MIN_COUNT / SNIPE_MAX_COUNT  抢单人数区间，默认 30/60
   SNIPE_DELAY_MS     抢单延迟(毫秒)，默认 0
   GAS_GWEI           固定 gas 价，默认 0.05；写 null 则改为自动(按链上价 × GAS_MULT)
-  CLAIM_INTERVAL_MS  领取返利扫描间隔，默认 30000
+  CLAIM_INTERVAL_MS  领取返利扫描间隔，默认 20000
   MIN_BNB_GAS        最低 BNB 提醒阈值，默认 0.005
   MINING_CLAIM_MS    矿机产出领取扫描间隔，默认 45000（只要可领就立刻领）
+  UPDATE_TOKEN       自动更新用的 GitHub 只读 token（在 --init 里配置）
   MINER_ENABLED      是否自动组矿机；MINER_MODE=old/new/both
 HELP
   exit 0
@@ -335,8 +336,9 @@ fi
 
 WIZ_ROOMS="0,1,2"; WIZ_MIN="30"; WIZ_MAX="60"; WIZ_DELAY="0"
 WIZ_GAS_MODE="fixed"; WIZ_GAS_FIXED="0.05"; WIZ_GAS_MAX="10"; WIZ_GAS_MULT="1.25"
-WIZ_CLAIM="30"; WIZ_BNB="0.005"
+WIZ_CLAIM="20"; WIZ_BNB="0.005"
 WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_MINER_MODE="old"; WIZ_CLAIM_WIN="1"
+WIZ_UPDATE_TOKEN=""
 
 # ---- 读现有 config.json 作为默认值 ----
 wiz_load() {
@@ -365,6 +367,7 @@ wiz_load() {
       MINER_USD)        WIZ_MINER_USD="$v" ;;
       CLAIM_WIN)        if [ "$v" = "0" ]; then WIZ_CLAIM_WIN="0"; else WIZ_CLAIM_WIN="1"; fi ;;
       MINER_MODE)       case "$v" in old|new|both) WIZ_MINER_MODE="$v" ;; esac ;;
+      UPDATE_TOKEN)     WIZ_UPDATE_TOKEN="$v" ;;
     esac
   done < <(node -e '
     const fs=require("fs");
@@ -386,7 +389,7 @@ wiz_load() {
     put("MINER_MODE",c.MINER_MODE);
   ' 2>/dev/null)
   # 兼容旧配置里 CLAIM_INTERVAL_MS 直接是毫秒
-  [ -n "$WIZ_CLAIM" ] || WIZ_CLAIM=30
+  [ -n "$WIZ_CLAIM" ] || WIZ_CLAIM=20
 
   # 手改 config.json 写成 "abc" 时，后面的 [ -ge ] 会报 integer expression expected，
   # 向导的默认值也会变成非法值。这里统一兜一道，非法就回默认。
@@ -394,7 +397,7 @@ wiz_load() {
   _is_num "$WIZ_MIN"       || WIZ_MIN=30
   _is_num "$WIZ_MAX"       || WIZ_MAX=60
   _is_num "$WIZ_DELAY"     || WIZ_DELAY=0
-  _is_num "$WIZ_CLAIM"     || WIZ_CLAIM=30
+  _is_num "$WIZ_CLAIM"     || WIZ_CLAIM=20
   _is_num "$WIZ_BNB"       || WIZ_BNB=0.005
   _is_num "$WIZ_GAS_MAX"   || WIZ_GAS_MAX=10
   _is_num "$WIZ_GAS_MULT"  || WIZ_GAS_MULT=1.25
@@ -459,6 +462,7 @@ wiz_header() {
   echo "    最低 BNB   : ${WIZ_BNB}"
   echo "    组矿机     : $(wiz_miner_text)"
   echo "    中奖处理   : $(wiz_claimwin_text)"
+  echo "    自动更新   : $(wiz_update_text)"
   echo "  ────────────────────────────────────────────────────"
 }
 
@@ -550,6 +554,37 @@ wiz_edit_bnb() {
   echo "    最低 BNB 余额: 低于这个值只提醒，不中断运行"
   wiz_ask_dec "最低 BNB" "$WIZ_BNB" 0 1
   WIZ_BNB="$REPLY"
+}
+
+wiz_update_text() {
+  if [ -n "$WIZ_UPDATE_TOKEN" ]; then
+    echo "已配置（${WIZ_UPDATE_TOKEN:0:4}****${WIZ_UPDATE_TOKEN: -4}）"
+  else
+    echo "未配置（私有仓库不会自动更新）"
+  fi
+}
+
+wiz_edit_update() {
+  local tok
+  wiz_header
+  echo "    ---- 自动更新（GitHub 只读 Token）----"
+  echo "      仓库是私有的，需要 GitHub token（Fine-grained: Contents = Read）"
+  echo "      直接回车 = 保持当前；输入 - = 清除并关闭自动更新"
+  echo "    当前: $(wiz_update_text)"
+  read -r -s -p "    粘贴 Token: " tok || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  echo ""
+  if [ -z "$tok" ]; then return 0; fi
+  if [ "$tok" = "-" ]; then
+    WIZ_UPDATE_TOKEN=""
+    ok_msg "已清除 Token（自动更新关闭）"
+    return 0
+  fi
+  case "$tok" in
+    gh[pousr]_*|github_pat_*) ;;
+    *) warn_msg "看起来不像 GitHub token，仍按输入保存" ;;
+  esac
+  WIZ_UPDATE_TOKEN="$tok"
+  ok_msg "已保存 Token（仅写入本地 config.json）"
 }
 
 wiz_edit_miner() {
@@ -714,7 +749,7 @@ wiz_defaults() {
     [Yy]*)
       WIZ_ROOMS="0,1,2"; WIZ_MIN="30"; WIZ_MAX="60"; WIZ_DELAY="0"
       WIZ_GAS_MODE="fixed"; WIZ_GAS_FIXED="0.05"; WIZ_GAS_MAX="10"; WIZ_GAS_MULT="1.25"
-      WIZ_CLAIM="30"; WIZ_BNB="0.005"
+      WIZ_CLAIM="20"; WIZ_BNB="0.005"
       WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_MINER_MODE="old"; WIZ_CLAIM_WIN="1"
       ok_msg "已恢复默认(尚未保存)" ;;
     *) echo "    已取消" ;;
@@ -733,6 +768,7 @@ wiz_commit() {
   WIZ_GAS_MODE="$WIZ_GAS_MODE" WIZ_GAS_FIXED="$WIZ_GAS_FIXED" WIZ_GAS_MAX="$WIZ_GAS_MAX" \
   WIZ_GAS_MULT="$WIZ_GAS_MULT" WIZ_CLAIM="$WIZ_CLAIM" WIZ_BNB="$WIZ_BNB" \
   WIZ_MINER="$WIZ_MINER" WIZ_MINER_USD="$WIZ_MINER_USD" WIZ_MINER_MODE="$WIZ_MINER_MODE" WIZ_CLAIM_WIN="$WIZ_CLAIM_WIN" \
+  WIZ_UPDATE_TOKEN="$WIZ_UPDATE_TOKEN" \
   node -e '
     const fs = require("fs");
     let c = {};
@@ -752,6 +788,8 @@ wiz_commit() {
     c.MINER_USD = Number(e.WIZ_MINER_USD);
     c.MINER_MODE = String(e.WIZ_MINER_MODE || "old");
     c.CLAIM_WIN = String(e.WIZ_CLAIM_WIN) === "1";
+    c.UPDATE_TOKEN = String(e.WIZ_UPDATE_TOKEN || "").trim();
+    c.AUTO_UPDATE = c.UPDATE_TOKEN.length > 0;
     const tmp = "config.json.tmp";
     fs.writeFileSync(tmp, JSON.stringify(c, null, 2) + "\n");
     // rename 失败时清掉 .tmp，别在目录里留垃圾
@@ -792,8 +830,8 @@ wiz_menu() {
   echo "      [3] 抢单延迟          [4] 手续费 / Gas"
   echo "      [5] 领取返利间隔      [6] 最低 BNB 余额"
   echo "      [7] 账号管理          [8] 恢复默认值"
-  echo "      [9] 中奖处理/组矿机   [10] 保存并退出"
-  echo "      [0] 不保存退出"
+  echo "      [9] 中奖处理/组矿机   [10] 自动更新"
+  echo "      [11] 保存并退出       [0] 不保存退出"
   echo "  ────────────────────────────────────────────────────"
 }
 
@@ -814,7 +852,8 @@ wizard_main() {
       7) wiz_accounts ;;
       8) wiz_defaults ;;
       9) wiz_edit_miner ;;
-      10) if wiz_commit; then return 0; fi ;;
+      10) wiz_edit_update ;;
+      11) if wiz_commit; then return 0; fi ;;
       0) echo ""; echo "  已退出，未做任何修改"; return 1 ;;
       *) ;;
     esac
