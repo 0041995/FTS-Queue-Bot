@@ -8,6 +8,7 @@
   "GAS_MULT": 1.25,
   "CLAIM_INTERVAL_MS": 20000,
   "MIN_BNB_GAS": 0.005,
+  "RPC_MAX_CONCURRENT": 10,
   "CLAIM_WIN": true,
   "MINER_ENABLED": false,
   "MINER_MODE": "old",

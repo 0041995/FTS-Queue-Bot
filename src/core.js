@@ -199,8 +199,8 @@ const CFG = {
   // nonce 断档自愈: 发现"有在途交易但 latest 长期不动"就补一笔自转填坑
   GAP_CHECK_MS: cfgNum(process.env.FTS_GAP_CHECK_MS, 20000, 'GAP_CHECK_MS'),
   GAP_STUCK_MS: cfgNum(process.env.FTS_GAP_STUCK_MS, 45000, 'GAP_STUCK_MS'),
-  // 并发与限流: 防止多账号同时打爆公共节点(429)
-  RPC_MAX_CONCURRENT: cfgNum(process.env.FTS_RPC_CONCURRENCY ?? userCfg.RPC_MAX_CONCURRENT, 4, 'RPC_MAX_CONCURRENT'),
+  // 并发与限流: 默认 10 路并发(支持 10 账号同时跑)，靠下面的间隔/错峰/429 退避防止打爆公共节点
+  RPC_MAX_CONCURRENT: cfgNum(process.env.FTS_RPC_CONCURRENCY ?? userCfg.RPC_MAX_CONCURRENT, 10, 'RPC_MAX_CONCURRENT'),
   RPC_MIN_SPACING_MS: cfgNum(process.env.FTS_RPC_SPACING_MS, 60, 'RPC_MIN_SPACING_MS'),
   ACCOUNT_STAGGER_MS: cfgNum(process.env.FTS_ACCOUNT_STAGGER_MS, 120, 'ACCOUNT_STAGGER_MS'),
   // 启动排水: 等上一轮未确认交易落地，避免重启后 nonce 回退
@@ -306,6 +306,13 @@ function validateCfg() {
   if (CFG.UPDATE_CHECK_MS < 60000) { p.push('UPDATE_CHECK_MS 太小，已改为 60000'); CFG.UPDATE_CHECK_MS = 60000; }
   if (CFG.UPDATE_IDLE_MARGIN < 0) { p.push('UPDATE_IDLE_MARGIN 不能为负，已改为 15'); CFG.UPDATE_IDLE_MARGIN = 15; }
   if (CFG.UPDATE_MAX_DEFER_MS < 600000) { p.push('UPDATE_MAX_DEFER_MS 太小，已改为 600000'); CFG.UPDATE_MAX_DEFER_MS = 600000; }
+  // 并发闸门: 默认 10，允许按需下调/小幅上调，但不许填超大值把公共节点打爆(那样只会吃 429)
+  if (!Number.isInteger(CFG.RPC_MAX_CONCURRENT) || CFG.RPC_MAX_CONCURRENT < 1 || CFG.RPC_MAX_CONCURRENT > 32) {
+    const fixed = Number.isFinite(CFG.RPC_MAX_CONCURRENT)
+      ? Math.min(32, Math.max(1, Math.floor(CFG.RPC_MAX_CONCURRENT))) : 10;
+    p.push(`RPC_MAX_CONCURRENT(${CFG.RPC_MAX_CONCURRENT}) 超出 1~32 范围，已改为 ${fixed}`);
+    CFG.RPC_MAX_CONCURRENT = fixed;
+  }
   return p.concat(cfgProblems);
 }
 
@@ -579,7 +586,7 @@ class RpcManager {
       await rpcGate.acquire();
       try {
         // 全局兜底超时: 没有它，一个卡死的 HTTP 请求会永久占住闸门名额，
-        // 累积几次后整个引擎静默死锁(4 个名额被 4 个挂起请求吃光)
+        // 累积几次后整个引擎静默死锁(所有名额被挂起请求吃光)
         const r = await withTimeout(Promise.resolve(fn(this.provider)), CFG.RPC_TIMEOUT_MS, 'rpc');
         this.failStreak = 0;
         return r;
