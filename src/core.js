@@ -105,15 +105,20 @@ const CFG = {
   HTTP_POOL: process.env.FTS_HTTP_POOL
     ? process.env.FTS_HTTP_POOL.split(',').map(s => s.trim()).filter(Boolean)
     : cfgArr(userCfg.HTTP_POOL, [
-      // 2026-11 实测可用(eth_chainId=0x38)；原 binance.org dataseed / llamarpc / 1rpc 等已不可用，移除。
-      'https://bsc-dataseed.bnbchain.org',
-      'https://bsc-dataseed1.bnbchain.org',
-      'https://bsc-dataseed2.defibit.io',
-      'https://bsc-rpc.publicnode.com',
-      'https://bsc.publicnode.com',
-      'https://bsc-mainnet.public.blastapi.io',
-      'https://bsc.blockrazor.xyz',
-      'https://bsc.meowrpc.com'
+      // 2026-11-27 实测: 42 个候选逐一验证 eth_blockNumber+eth_call+延迟(3次取平均)，筛出下列 11 个优质节点。
+      // Tier A = bnbchain 官方(平均~200ms, 闸门14)；Tier B = 公共节点(平均~500-600ms, 闸门12)。
+      // ninicoin/nodereal/meowrpc/defibit/blockrazor/0.48club 等已剔除(延迟>1.4s 或大量失败)。
+      'https://bsc-dataseed.bnbchain.org',      // A ~199ms
+      'https://bsc-dataseed1.bnbchain.org',     // A ~213ms
+      'https://bsc-dataseed2.bnbchain.org',     // A ~213ms
+      'https://bsc-dataseed3.bnbchain.org',     // A ~228ms
+      'https://bsc-dataseed4.bnbchain.org',     // A ~230ms
+      'https://bsc.api.pocket.network',         // B ~484ms
+      'https://bsc.rpc.sentio.xyz',             // B ~498ms
+      'https://bsc-mainnet.public.blastapi.io', // B ~538ms
+      'https://bsc-rpc.publicnode.com',         // B ~545ms
+      'https://rpc-bsc.48.club',                // B ~601ms
+      'https://bsc.publicnode.com'              // B ~602ms
     ], 'HTTP_POOL').map(s => String(s).trim()).filter(Boolean),
   WSS_POOL: process.env.FTS_WSS_POOL
     ? process.env.FTS_WSS_POOL.split(',').map(s => s.trim()).filter(Boolean)
@@ -199,11 +204,32 @@ const CFG = {
   // nonce 断档自愈: 发现"有在途交易但 latest 长期不动"就补一笔自转填坑
   GAP_CHECK_MS: cfgNum(process.env.FTS_GAP_CHECK_MS, 20000, 'GAP_CHECK_MS'),
   GAP_STUCK_MS: cfgNum(process.env.FTS_GAP_STUCK_MS, 45000, 'GAP_STUCK_MS'),
-  // 并发与限流: 默认 8 路(实测并发8延迟最优p95≈150ms；16 是延迟恶化拐点p95≈485ms)。
-  // 8 距拐点留 50% 余量，仍足够 10+ 账号(账号错峰+排队，账号数≠并发数)。间隔/错峰/429 退避再兜底。
-  RPC_MAX_CONCURRENT: cfgNum(process.env.FTS_RPC_CONCURRENCY ?? userCfg.RPC_MAX_CONCURRENT, 8, 'RPC_MAX_CONCURRENT'),
-  RPC_MIN_SPACING_MS: cfgNum(process.env.FTS_RPC_SPACING_MS, 60, 'RPC_MIN_SPACING_MS'),
+  // 并发与限流: 多节点分层，每个节点独立闸门(见 NODE_TIER_CONCURRENCY)。
+  // RPC_MAX_CONCURRENT 作为"单节点闸门上限"的默认兜底与全局总闸的参考值。
+  // 实测(2026-11-27, 每节点120请求): 官方节点并发16是延迟拐点、14最优(p95 158-314ms)；
+  // 公共节点(publicnode/blastapi/48club)并发14拐点、12更稳。取拐点前一位，不取50%。
+  RPC_MAX_CONCURRENT: cfgNum(process.env.FTS_RPC_CONCURRENCY ?? userCfg.RPC_MAX_CONCURRENT, 12, 'RPC_MAX_CONCURRENT'),
+  RPC_MIN_SPACING_MS: cfgNum(process.env.FTS_RPC_SPACING_MS, 40, 'RPC_MIN_SPACING_MS'),
   ACCOUNT_STAGGER_MS: cfgNum(process.env.FTS_ACCOUNT_STAGGER_MS, 120, 'ACCOUNT_STAGGER_MS'),
+  // 多节点分层: 每个节点一个独立闸门，账号平摊到节点，节点闸门满/冷却时溢出到下一个节点。
+  // 闸门值按节点档位: bnbchain 官方(快)14, 其他公共节点(慢)12, 均取实测拐点前一位。
+  // 可用 config.json 的 NODE_TIER_CONCURRENCY 覆盖，格式 {"fast":14,"slow":12}。
+  NODE_TIER_CONCURRENCY: (() => {
+    const raw = userCfg.NODE_TIER_CONCURRENCY;
+    const d = { fast: 14, slow: 12 };
+    if (!raw || typeof raw !== 'object') return d;
+    const f = Number(raw.fast), s = Number(raw.slow);
+    return {
+      fast: Number.isFinite(f) && f >= 1 && f <= 16 ? Math.floor(f) : d.fast,
+      slow: Number.isFinite(s) && s >= 1 && s <= 16 ? Math.floor(s) : d.slow
+    };
+  })(),
+  // 节点分层开关(默认开)。关掉时退回单节点全局闸门模式。
+  NODE_POOL_ENABLED: (() => {
+    const raw = process.env.FTS_NODE_POOL ?? userCfg.NODE_POOL_ENABLED;
+    if (raw === undefined || raw === null || raw === '') return true;
+    return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
+  })(),
   // 启动排水: 等上一轮未确认交易落地，避免重启后 nonce 回退
   STARTUP_DRAIN_MS: cfgNum(process.env.FTS_DRAIN_MS, 30000, 'STARTUP_DRAIN_MS'),
   // ---- 灵活资金决策(多账号互相匀 gas / 凑 USDT) ----
@@ -510,6 +536,62 @@ class Semaphore {
 }
 const rpcGate = new Semaphore(CFG.RPC_MAX_CONCURRENT);
 
+// ---------------- 多节点分层池 ----------------
+// 每个节点一个独立闸门(按档位定阈值)，账号平摊到节点；节点闸门满/冷却时溢出到负载最低的健康节点。
+// 这样 100 个账号的请求分散到 N 个节点并行，而不是全挤在单一节点/单一闸门。
+function nodeTier(url) {
+  // bnbchain 官方域名 = 快档(闸门14)，其余公共节点 = 慢档(闸门12)
+  return /bnbchain\.org/.test(url) ? 'fast' : 'slow';
+}
+class NodeConn {
+  constructor(url, max) {
+    this.url = url;
+    this.gate = new Semaphore(max);
+    this.provider = new ethers.JsonRpcProvider(url, CFG.CHAIN_ID, { staticNetwork: true });
+    this.cooldownUntil = 0;
+    this.latency = 0;
+    this.ok = true;
+    this.inflight = 0;
+    this.sent = 0;
+    this.failed = 0;
+  }
+  get available() { return this.ok && this.cooldownUntil <= Date.now(); }
+  get load() { return this.gate.n / this.gate.max; }
+}
+class NodePool {
+  constructor(urls) {
+    this.nodes = urls.map(u => new NodeConn(u, CFG.NODE_TIER_CONCURRENCY[nodeTier(u)]));
+    this.enabled = CFG.NODE_POOL_ENABLED && this.nodes.length > 0;
+  }
+  // 选节点: 优先 preferred(账号专属节点)，其不可用/满则挑负载最低的健康节点
+  pick(preferred) {
+    const healthy = this.nodes.filter(n => n.available);
+    const pool = healthy.length ? healthy : this.nodes;
+    if (preferred && preferred.available && preferred.load < 0.9) return preferred;
+    // 负载最低优先，同负载按延迟低优先
+    return pool.slice().sort((a, b) => (a.load - b.load) || (a.latency - b.latency))[0];
+  }
+  // 在选中节点的闸门内执行 fn(provider, node)。核心: 把请求分散到各节点独立闸门。
+  // fn 第二个参数是选中的节点对象，供 RpcManager 在 429/失败时精准冷却该节点。
+  async run(fn, preferred) {
+    if (!this.enabled) return rpcGate.run(() => fn(this.nodes[0].provider, this.nodes[0]));
+    const node = this.pick(preferred);
+    await node.gate.acquire();
+    node.inflight++;
+    try {
+      const r = await fn(node.provider, node);
+      node.sent++;
+      return r;
+    } finally {
+      node.inflight--;
+      node.gate.release();
+    }
+  }
+  cooldown(node, ms) { if (node) { node.cooldownUntil = Date.now() + (ms || 30000); } }
+  stats() { return this.nodes.map(n => `${n.url.replace('https://','')}:${n.gate.max}/${n.inflight}${n.available ? '' : '(冷却)'}`).join(' '); }
+}
+const nodePool = new NodePool(CFG.HTTP_POOL);
+
 // ---------------- 429 / 限流识别 ----------------
 function isRateLimited(e) {
   const s = (e.shortMessage || e.message || '') + (e.info && e.info.error && e.info.error.message || '');
@@ -557,6 +639,17 @@ class RpcManager {
       throw new Error('所有 HTTP 节点不可用: ' + detail);
     }
     good.forEach(r => info('SYS', `节点可用: ${r.url} 延迟=${r.latency}ms 高度=${r.height}`));
+    // 把探测结果同步到 nodePool: 不可用节点标记冷却，可用的记录延迟
+    if (nodePool.enabled) {
+      const goodUrls = new Set(good.map(r => r.url));
+      for (const n of nodePool.nodes) {
+        const gr = good.find(r => r.url === n.url);
+        if (gr) { n.latency = gr.latency; n.ok = true; }
+        else { n.ok = false; n.cooldownUntil = Date.now() + 300000; }
+      }
+      nodePool.nodes.sort((a, b) => (a.latency || 99999) - (b.latency || 99999));
+      ok('SYS', `节点分层池已就绪: ${nodePool.nodes.filter(n => n.ok).length}/${nodePool.nodes.length} 个节点，每节点独立闸门(${CFG.NODE_TIER_CONCURRENCY.fast}/${CFG.NODE_TIER_CONCURRENCY.slow})`);
+    }
     this.index = this.urls.indexOf(good[0].url);
     this.provider = this.makeProvider(good[0].url);
     ok('SYS', `主节点: ${good[0].url} (${good[0].latency}ms)`);
@@ -594,36 +687,40 @@ class RpcManager {
     await sleep(3000);
     return false;
   }
-  async rpc(fn, label) {
+  async rpc(fn, label, preferred) {
     let lastErr;
+    let usedNode = null;
     for (let i = 0; i < CFG.MAX_RPC_RETRY; i++) {
       // 闸门只保护"发请求"这一瞬间；重试的退避/换节点必须在闸门外，
       // 否则一次慢/失败的重试会占住名额，把整个引擎堵死(实测会静默卡住)
-      await rpcGate.acquire();
+      // 通过 nodePool 分发: fn 收到被选中节点的 provider 和 node 对象。
       try {
-        // 全局兜底超时: 没有它，一个卡死的 HTTP 请求会永久占住闸门名额，
-        // 累积几次后整个引擎静默死锁(所有名额被挂起请求吃光)
-        const r = await withTimeout(Promise.resolve(fn(this.provider)), CFG.RPC_TIMEOUT_MS, 'rpc');
+        const r = await nodePool.run((provider, node) => {
+          usedNode = node;
+          // 全局兜底超时: 没有它，一个卡死的 HTTP 请求会永久占住闸门名额，静默死锁
+          return withTimeout(Promise.resolve(fn(provider, node)), CFG.RPC_TIMEOUT_MS, 'rpc');
+        }, preferred);
         this.failStreak = 0;
         return r;
       } catch (e) {
         lastErr = e;
         this.failStreak++;
-      } finally {
-        rpcGate.release();
       }
       // ---- 以下重试逻辑都在闸门之外 ----
       if (isRateLimited(lastErr)) {
         this.stats429++;
         const backoff = 2000 * (i + 1);
-        warn('SYS', `节点限流(429) 第 ${this.stats429} 次，冷却 ${this.urls[this.index]} 30s 并切换节点: ${formatError(lastErr).slice(0, 110)}`);
-        markCooldown(this.urls[this.index], 30000);
+        const badUrl = usedNode ? usedNode.url : this.urls[this.index];
+        warn('SYS', `节点限流(429) 第 ${this.stats429} 次，冷却 ${badUrl} 30s 并切换到其它节点: ${formatError(lastErr).slice(0, 110)}`);
+        nodePool.cooldown(usedNode, 30000);
+        markCooldown(badUrl, 30000);
         await this.rotate();
         await sleep(backoff);
         continue;
       }
       const transient = ['NETWORK_ERROR', 'SERVER_ERROR', 'TIMEOUT', 'BAD_DATA'].includes(lastErr.code) || !lastErr.code;
       if (transient) {
+        if (usedNode) { usedNode.failed++; nodePool.cooldown(usedNode, this.failStreak >= 2 ? 15000 : 3000); }
         if (this.failStreak >= 2) await this.rotate();
         await sleep(400 * (i + 1));
         continue;
@@ -633,14 +730,18 @@ class RpcManager {
     throw lastErr;
   }
   // 统一的"受闸门保护"的直连调用(用于不经过重试逻辑的场景)
-  gated(fn) { return rpcGate.run(fn); }
+  gated(fn) { return nodePool.enabled ? nodePool.run(fn) : rpcGate.run(fn); }
+  // 账号专属节点: 按索引平摊到各节点(节点数=账号数时一对一，多账号则轮转平摊)
+  nodeFor(index) { return nodePool.enabled ? nodePool.nodes[index % nodePool.nodes.length] : null; }
 }
 
 // ---------------- 全局状态 ----------------
 const mgr = new RpcManager(CFG.HTTP_POOL);
 const instances = [];
 
-function bind(inst, provider) {
+function bind(inst, provider, node) {
+  // 多节点分层: 账号专属节点用于写交易(wallet/contract)；单节点模式退回主节点
+  if (node) inst.node = node;
   inst.provider = provider;
   inst.wallet = new ethers.Wallet(inst.pk, provider);
   inst.queue = new ethers.Contract(CFG.QUEUE_ADDR, QUEUE_ABI, inst.wallet);
@@ -666,7 +767,20 @@ async function resolveReferrer(inst) {
   inst.referrer = ZERO_ADDR;
   return ZERO_ADDR;
 }
-mgr.onRotate(p => instances.forEach(i => bind(i, p)));
+mgr.onRotate(p => {
+  // 分层模式: 账号已有专属节点，不随主节点轮换整体改绑(否则分层失效)。
+  // 只有账号专属节点被冷却/失效时，才重新分配到当前最健康节点。
+  if (nodePool.enabled) {
+    for (const i of instances) {
+      if (!i.node || !i.node.available) {
+        const n = nodePool.pick(null);
+        bind(i, n.provider, n);
+      }
+    }
+  } else {
+    instances.forEach(i => bind(i, p));
+  }
+});
 
 // ---------------- WebSocket 可用性 ----------------
 function ensureWebSocket() {
@@ -2189,6 +2303,7 @@ async function main() {
   bindRead(mgr.provider);
   await detectEip1559();
 
+  let acctIdx = 0;
   for (const w of wallets) {
     const inst = {
       conf: w, pk: w.pk, address: w.wallet.address, wallet: null, provider: null, queue: null, usdt: null,
@@ -2201,9 +2316,11 @@ async function main() {
       bnbCache: null,
       stats: { sent: 0, failed: 0 }
     };
-    bind(inst, mgr.provider);
+    // 账号平摊到节点: 节点数=账号数时一对一，多账号轮转。每个账号的读写优先走专属节点。
+    const node = mgr.nodeFor(acctIdx++);
+    bind(inst, node ? node.provider : mgr.provider, node);
     instances.push(inst);
-    ok(inst.address, '账号加载完成');
+    ok(inst.address, `账号加载完成${node ? ' → 节点 ' + node.url.replace('https://', '') : ''}`);
   }
 
   // 排水并行做: 串行时 10 个账号最坏要等 5 分钟才能开始抢第一单
@@ -2233,7 +2350,10 @@ async function main() {
   setInterval(() => {
     const s = instances.map(i => `${short(i.address)}(tx${i.stats.sent}/f${i.stats.failed})`).join(' ');
     // 带上块高/已处理块数，方便一眼看出"是不是卡住了"
-    info('SYS', `心跳 | 节点=${CFG.HTTP_POOL[mgr.index]} | WS=${stream.wsOk ? '连接' : '轮询'} | 块高=${stream.lastHeight} 已处理=${stream.tickCount} 去重=${stream.dupSkipped} | ${s}`);
+    const nodeDesc = nodePool.enabled
+      ? `节点池=${nodePool.nodes.filter(n => n.available).length}/${nodePool.nodes.length} [${nodePool.stats()}]`
+      : `节点=${CFG.HTTP_POOL[mgr.index]}`;
+    info('SYS', `心跳 | ${nodeDesc} | WS=${stream.wsOk ? '连接' : '轮询'} | 块高=${stream.lastHeight} 已处理=${stream.tickCount} 去重=${stream.dupSkipped} | ${s}`);
   }, 60000);
 
   // 未捕获异常: 单次异常继续跑(公共节点抖动很常见)，但短时间连续爆就退出，
