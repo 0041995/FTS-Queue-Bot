@@ -2147,8 +2147,9 @@ async function tryApplyUpdate(asset, force) {
 
 async function updateLoop() {
   const asset = process.platform === 'win32' ? 'autofts.ps1' : 'autofts.sh';
-  // 不在启动时查：先静默等一个周期
-  await sleep(CFG.UPDATE_CHECK_MS + Math.random() * 60000);
+  // 启动即检测一次(用户要求): 立刻知道有没有新版本，不用等一个周期。
+  // 注意只是"检测+标记"，真正应用仍等空闲窗口(tryApplyUpdate 忙则返回)，不会打断抢单。
+  info('SYS', '启动自动检测更新...');
   while (true) {
     try {
       if (updatePendingTag) {
@@ -2439,15 +2440,26 @@ function getWalletPassword() {
 // 游戏前端把合约地址写成 VITE_P2_XXX:"0x..." 映射在 JS bundle 里，网页换合约时
 // 这个映射会变。直接抓页面 -> 提取 JS 地址 -> 解析映射 -> 写回 config.json，
 // 无需改代码。所有地址都做链上代码存在性校验，避免抓到假地址。
+// 脚本真正用到的合约字段 <- 网页 VITE 键名。一个字段可对应多个候选键(按顺序取第一个命中)。
 const WEB_CONTRACT_MAP = {
-  QUEUE_ADDR: 'VITE_P2_QUEUE',
-  MINER_QUEUE_ADDR: 'VITE_P2_LEGACY_QUEUE',
-  MINING_VAULT_ADDR: 'VITE_P2_MINING',
-  LEGACY_MINING_ADDR: 'VITE_P2_LEGACY_MINING',
-  USDT_ADDR: 'VITE_P2_USDT',
-  FTS_ADDR: 'VITE_P2_TOKEN',
-  MARKET_ADDR: 'VITE_MARKET_ESCROW'
+  QUEUE_ADDR: ['VITE_P2_QUEUE'],
+  MINER_QUEUE_ADDR: ['VITE_P2_LEGACY_QUEUE', 'VITE_P2_LEGACY_QUEUE_V7'],
+  MINING_VAULT_ADDR: ['VITE_P2_MINING'],
+  LEGACY_MINING_ADDR: ['VITE_P2_LEGACY_MINING'],
+  USDT_ADDR: ['VITE_P2_USDT', 'VITE_USDT_ADDRESS'],
+  FTS_ADDR: ['VITE_P2_TOKEN', 'VITE_TOKEN_ADDRESS'],
+  MARKET_ADDR: ['VITE_MARKET_ESCROW'],
+  PAIR_ADDR: ['VITE_P2_PAIR']
 };
+// ABI 特征 -> 合约字段。VITE 映射缺失/改名时的兜底识别：
+// 地址附近(上下文窗口)出现这组函数名，就认定是该类合约。
+const ABI_FINGERPRINTS = [
+  { field: 'QUEUE_ADDR', need: ['enterQueue', 'roomConfigs'] },
+  { field: 'MARKET_ADDR', need: ['nextOrderId', 'fillOrder'] },
+  { field: 'MINING_VAULT_ADDR', need: ['pendingOf', 'trancheCount'] },
+  { field: 'LEGACY_MINING_ADDR', need: ['pendingReward', 'machineOf'] },
+  { field: 'PAIR_ADDR', need: ['getReserves', 'token0'] }
+];
 async function fetchText(url, timeoutMs) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs || 15000);
@@ -2462,44 +2474,176 @@ function absoluteUrl(base, path) {
 }
 // 探测网页返回 {found:{configKey:addr}, all:{VITE_*:addr}, jsUrls}
 // 同时抓游戏页和市场页(市场合约 VITE_MARKET_ESCROW 只在市场页 bundle 里)
-async function probeWebContracts(gameUrl, marketUrl) {
-  const pages = [gameUrl, marketUrl].filter(Boolean);
-  const found = {}, all = {}, jsUrls = [];
-  for (const pageUrl of pages) {
+// 并发受限的批量抓取: 同一域名下 JS 很多，一次全抓会打爆站点也会拖慢启动
+async function fetchMany(urls, limit, timeoutMs) {
+  const out = [];
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, urls.length) }, async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= urls.length) return;
+      try { out[idx] = { url: urls[idx], body: await fetchText(urls[idx], timeoutMs || 20000) }; }
+      catch (e) { out[idx] = { url: urls[idx], body: null }; }
+    }
+  });
+  await Promise.all(workers);
+  return out.filter(x => x && x.body);
+}
+// 从 HTML 里提取同域链接(页面 + JS)，用于"整个站点都扫一遍"
+function extractLinks(html, baseUrl, origin) {
+  const pages = [], scripts = [];
+  for (const m of html.matchAll(/<a[^>]+href=["']([^"'#]+)["']/gi)) {
+    const u = absoluteUrl(baseUrl, m[1]);
+    if (u && u.startsWith(origin) && !/\.(png|jpg|jpeg|gif|svg|css|ico|woff2?|ttf|pdf|zip)$/i.test(u)) pages.push(u);
+  }
+  for (const m of html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)) {
+    const u = absoluteUrl(baseUrl, m[1]);
+    if (u && u.startsWith(origin) && /\.js(\?|$)/i.test(u)) scripts.push(u);
+  }
+  return { pages: [...new Set(pages)], scripts: [...new Set(scripts)] };
+}
+// 从 JS 正文里提取它 import 的 chunk。
+// Vite 产物既可能是 "assets/Xxx-hash.js" 也可能是 "./Xxx-hash.js"，
+// 统一按"相对该 JS 自身 URL"解析，再只保留同域结果。
+function extractChunks(js, jsUrl, origin) {
+  const out = [];
+  for (const m of js.matchAll(/["']([^"']+\.js)["']/g)) {
+    const raw = m[1];
+    if (/^(https?:)?\/\//i.test(raw)) continue;   // 外站绝对地址
+    if (/vendor/i.test(raw)) continue;            // 第三方库，无业务地址
+    // 路径解析: 以 / 或 assets/ 开头 -> 站根；否则相对当前 JS 所在目录。
+    // 不能一律用 jsUrl 解析，否则 assets/X.js 会变成 /assets/assets/X.js(404)。
+    let u;
+    if (raw.startsWith('/') || raw.startsWith('assets/')) u = absoluteUrl(origin + '/', raw);
+    else u = absoluteUrl(jsUrl, raw);
+    if (u && u.startsWith(origin)) out.push(u);
+  }
+  return [...new Set(out)];
+}
+// 广域探测: 从用户配置的页面出发，扫同域页面 + 递归扫 JS chunk，
+// 汇总所有 VITE_* 映射；VITE 缺失时用 ABI 特征兜底识别。
+// 返回 {found:{configField:addr}, all:{VITE_KEY:addr}, jsUrls, pagesScanned, viaAbi}
+async function probeWebContracts(gameUrl, marketUrl, deep) {
+  deep = deep !== false;   // 默认完整扫描；启动时传 false 走轻量(只抓主bundle+一层chunk)
+  const startPages = [gameUrl, marketUrl].filter(Boolean);
+  if (!startPages.length) throw new Error('未配置游戏/市场网址');
+  let origin;
+  try { origin = new URL(startPages[0]).origin; } catch (e) { throw new Error('网址格式错误: ' + startPages[0]); }
+
+  const MAX_PAGES = deep ? 15 : 2, MAX_JS = deep ? 40 : 8;
+  const pagesSeen = new Set(), jsSeen = new Set(), jsQueue = [];
+  const found = {}, all = {};
+  const addJs = u => { if (u && !jsSeen.has(u) && jsSeen.size + jsQueue.length < MAX_JS) jsQueue.push(u); };
+
+  // 1) 抓起始页 + 同域链接页。SPA 各路由往往返回同一份 HTML，用内容指纹去重避免重复解析。
+  const pageQueue = [...startPages];
+  const htmlSeen = new Set();
+  while (pageQueue.length && pagesSeen.size < MAX_PAGES) {
+    const pageUrl = pageQueue.shift();
+    if (pagesSeen.has(pageUrl)) continue;
+    pagesSeen.add(pageUrl);
     let html;
     try { html = await fetchText(pageUrl, 15000); } catch (e) { continue; }
-    // 提取 <script src="..."> 里的 JS；主 bundle + 页面 chunk(如 MarketPage-xxx.js) 都要
-    const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+\.js)["']/gi)].map(m => m[1]);
-    const main = scripts.filter(s => !/vendor/i.test(s));
-    const candidates = (main.length ? main : scripts).map(s => absoluteUrl(pageUrl, s)).filter(Boolean);
-    // 主 bundle 可能 import 页面 chunk，从 JS 里再提取 assets/*.js
-    let jsBodies = [];
-    for (const jsUrl of candidates.slice(0, 2)) {
-      let js;
-      try { js = await fetchText(jsUrl, 30000); } catch (e) { continue; }
-      jsBodies.push({ url: jsUrl, body: js });
-      jsUrls.push(jsUrl);
-      // 找 import 的页面 chunk(如 MarketPage-xxx.js)
-      const chunks = [...new Set((js.match(/["'][^"']*assets\/[A-Za-z0-9_-]+\.js["']/g) || []))]
-        .map(x => x.replace(/^["']|["']$/g, ''));
-      for (const ch of chunks.slice(0, 20)) {
-        const cu = absoluteUrl(pageUrl, ch.startsWith('/') ? ch : '/assets/' + ch.split('/').pop());
-        if (!cu || jsUrls.includes(cu)) continue;
-        try { const cb = await fetchText(cu, 15000); jsBodies.push({ url: cu, body: cb }); jsUrls.push(cu); } catch (e) { }
-      }
-    }
-    for (const { body } of jsBodies) {
+    const fp = html.length + ':' + html.slice(0, 300);
+    if (htmlSeen.has(fp)) continue;      // 同一份 SPA 外壳，已解析过
+    htmlSeen.add(fp);
+    const { pages, scripts } = extractLinks(html, pageUrl, origin);
+    // 主 bundle 优先(vendor 太大且无业务地址，跳过)
+    scripts.filter(s => !/vendor/i.test(s)).forEach(addJs);
+    pages.filter(p => !pagesSeen.has(p)).forEach(p => pageQueue.push(p));
+  }
+
+  // 2) 逐层抓 JS，并从 JS 里继续发现 chunk(最多两轮，避免无限递归)
+  for (let round = 0; round < 2 && jsQueue.length; round++) {
+    const batch = jsQueue.splice(0, jsQueue.length).filter(u => !jsSeen.has(u));
+    batch.forEach(u => jsSeen.add(u));
+    const bodies = await fetchMany(batch, 10, 25000);
+    for (const { url, body } of bodies) {
+      // VITE 映射
       const re = /(VITE_[A-Z0-9_]+)\s*:\s*["'](0x[a-fA-F0-9]{40})["']/g;
       let m;
       while ((m = re.exec(body))) {
         all[m[1]] = m[2];
-        for (const [cfgKey, viteKey] of Object.entries(WEB_CONTRACT_MAP)) {
-          if (m[1] === viteKey && !found[cfgKey]) found[cfgKey] = m[2];
+        for (const [field, keys] of Object.entries(WEB_CONTRACT_MAP)) {
+          if (!found[field] && keys.includes(m[1])) found[field] = m[2];
+        }
+      }
+      // 继续发现 chunk
+      if (round === 0) extractChunks(body, url, origin).filter(u => !jsSeen.has(u)).forEach(addJs);
+    }
+  }
+
+  // 2b) 从 JS 里提取站内路由(SPA 的导航写在 JS 里，HTML 的 <a> 抓不到)，
+  // 再抓这些页面 —— 保证"同域名下任何链接"都覆盖到。
+  if (deep && pagesSeen.size < MAX_PAGES) {
+    const routeSet = new Set();
+    const bodies = await fetchMany([...jsSeen].slice(0, 8), 4, 20000);
+    for (const { body } of bodies) {
+      for (const m of body.matchAll(/["'`](\/[a-z][a-z0-9/_-]{2,40})["'`]/g)) {
+        const p = m[1];
+        // 只保留像路由的(排除 assets/静态资源)
+        if (/^\/(dapp|dashboard|market|game|claim|ranks|v9|relief|lp|operator|simulator)/i.test(p) && !/\.(js|css|png|svg|jpg)$/i.test(p)) {
+          routeSet.add(p);
+        }
+      }
+    }
+    for (const p of routeSet) {
+      if (pagesSeen.size >= MAX_PAGES) break;
+      const u = absoluteUrl(origin + '/', p);
+      if (!u || pagesSeen.has(u)) continue;
+      pagesSeen.add(u);
+      try {
+        const html = await fetchText(u, 12000);
+        const { scripts } = extractLinks(html, u, origin);
+        scripts.filter(s => !/vendor/i.test(s)).forEach(addJs);
+      } catch (e) { }
+    }
+    // 新发现的 chunk 也抓一遍(补全)
+    const extra = jsQueue.splice(0, jsQueue.length).filter(u => !jsSeen.has(u));
+    extra.forEach(u => jsSeen.add(u));
+    if (extra.length) {
+      const more = await fetchMany(extra, 10, 20000);
+      for (const { body } of more) {
+        const re = /(VITE_[A-Z0-9_]+)\s*:\s*["'](0x[a-fA-F0-9]{40})["']/g;
+        let m;
+        while ((m = re.exec(body))) {
+          all[m[1]] = m[2];
+          for (const [field, keys] of Object.entries(WEB_CONTRACT_MAP)) {
+            if (!found[field] && keys.includes(m[1])) found[field] = m[2];
+          }
         }
       }
     }
   }
-  return { found, all, jsUrls };
+
+  // 3) ABI 特征兜底: 对还没有值的字段，在 JS 里找"地址附近出现特征函数名"的
+  const viaAbi = {};
+  if (Object.keys(found).length < Object.keys(WEB_CONTRACT_MAP).length) {
+    const missing = ABI_FINGERPRINTS.filter(fp => !found[fp.field]);
+    if (missing.length) {
+      const bodies = await fetchMany([...jsSeen].slice(0, 20), 10, 20000);
+      for (const { body } of bodies) {
+        for (const fp of missing) {
+          if (found[fp.field]) continue;
+          const addr = findAddressByFingerprint(body, fp.need);
+          if (addr) { found[fp.field] = addr; viaAbi[fp.field] = addr; }
+        }
+      }
+    }
+  }
+  return { found, all, jsUrls: [...jsSeen], pagesScanned: pagesSeen.size, viaAbi };
+}
+// 在 JS 文本里找"上下文含指定函数名"的地址
+function findAddressByFingerprint(js, needFns) {
+  const addrRe = /0x[a-fA-F0-9]{40}/g;
+  let m;
+  while ((m = addrRe.exec(js))) {
+    const addr = m[0];
+    if (/^0x0{40}$/.test(addr)) continue;
+    const ctx = js.slice(Math.max(0, m.index - 3000), m.index + 3000);
+    if (needFns.every(fn => ctx.includes(fn))) return addr;
+  }
+  return null;
 }
 // 校验地址在链上有代码；返回 {addr:bool}
 async function validateContractAddresses(addrs) {
@@ -2534,12 +2678,15 @@ function saveWebContracts(found) {
   return changed;
 }
 // 完整同步流程: 探测 -> 校验链上代码 -> 写回；返回报告
-async function syncWebContracts(apply) {
-  info('SYS', `从游戏网页探测合约: ${CFG.GAME_URL}`);
-  const r = await probeWebContracts(CFG.GAME_URL, CFG.MARKET_URL);
+async function syncWebContracts(apply, deep) {
+  info('SYS', `从网页广域探测合约: ${CFG.GAME_URL}`);
+  const r = await probeWebContracts(CFG.GAME_URL, CFG.MARKET_URL, deep);
   const keys = Object.keys(r.found);
   if (!keys.length) throw new Error('未从网页解析到任何合约地址(JS 结构可能变化)');
-  info('SYS', `找到 ${keys.length} 个合约映射: ${keys.join(', ')}`);
+  info('SYS', `扫描 ${r.pagesScanned} 个页面 / ${r.jsUrls.length} 个 JS，找到 ${keys.length} 个合约: ${keys.join(', ')}`);
+  if (r.viaAbi && Object.keys(r.viaAbi).length) {
+    info('SYS', `其中 ${Object.keys(r.viaAbi).join(', ')} 由 ABI 特征识别(VITE 映射缺失)`);
+  }
   // 链上校验(用 mgr.provider; 若尚未 pickBest 则临时建一个)
   if (!mgr.provider) {
     try { await mgr.pickBest(); } catch (e) { warn('SYS', '链上校验跳过(RPC 不可用): ' + formatError(e).slice(0, 100)); }
@@ -2552,7 +2699,7 @@ async function syncWebContracts(apply) {
     else warn('SYS', `${k}=${r.found[k]} 链上无代码，已忽略`);
   }
   const changed = apply ? saveWebContracts(accepted) : 0;
-  return { found: r.found, accepted, all: r.all, jsUrls: r.jsUrls, changed };
+  return { found: r.found, accepted, all: r.all, jsUrls: r.jsUrls, pagesScanned: r.pagesScanned, viaAbi: r.viaAbi, changed };
 }
 
 // ---------------- FTS 自动买卖 ----------------
@@ -2816,7 +2963,7 @@ async function main() {
   catch (e) { fatal('SYS', 'RPC 初始化失败: ' + formatError(e)); exitFlush(22); return; }
   // 网页合约自动同步: 后台异步检测，不阻塞启动。发现新合约写回 config.json，下次重启生效。
   if (CFG.WEB_AUTO_SYNC && MODE === 'run') {
-    syncWebContracts(true)
+    syncWebContracts(true, false)   // 启动用轻量扫描(不拖带宽)，--sync-web 手动时才是完整扫描
       .then(r => { if (r.changed) warn('SYS', `网页检测到 ${r.changed} 个合约地址变化，已写入 config.json，重启后生效`); })
       .catch(e => warnOnce('SYS', '网页合约同步失败(不影响本次运行): ' + formatError(e).slice(0, 120), 300000));
   }

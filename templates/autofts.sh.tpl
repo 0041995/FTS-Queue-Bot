@@ -343,6 +343,8 @@ WIZ_UPDATE_TOKEN=""
 # FTS 自动买卖(默认关、阈值留空不设默认值)
 WIZ_BUY_ON="0"; WIZ_BUY_MAX_PRICE=""; WIZ_BUY_MAX_TOTAL=""
 WIZ_SELL_ON="0"; WIZ_SELL_MODE="fixed"; WIZ_SELL_PRICE=""; WIZ_SELL_AMOUNT=""
+# 授权额度: mode=rounds(按场数) / usd(按U数)
+WIZ_APPROVE_MODE="rounds"; WIZ_APPROVE_ROUNDS="1"; WIZ_APPROVE_USD=""
 
 # ---- 读现有 config.json 作为默认值 ----
 wiz_load() {
@@ -380,6 +382,9 @@ wiz_load() {
       TRADE_SELL_MODE)  case "$v" in fixed|spotminus) WIZ_SELL_MODE="$v" ;; esac ;;
       TRADE_SELL_PRICE) WIZ_SELL_PRICE="$v" ;;
       TRADE_SELL_AMOUNT) WIZ_SELL_AMOUNT="$v" ;;
+      APPROVE_MODE)     case "$v" in rounds|usd) WIZ_APPROVE_MODE="$v" ;; esac ;;
+      APPROVE_ROUNDS)   WIZ_APPROVE_ROUNDS="$v" ;;
+      APPROVE_USD)      WIZ_APPROVE_USD="$v" ;;
     esac
   done < <(node -e '
     const fs=require("fs");
@@ -407,6 +412,9 @@ wiz_load() {
     put("TRADE_SELL_MODE",c.TRADE_SELL_MODE);
     put("TRADE_SELL_PRICE",c.TRADE_SELL_PRICE);
     put("TRADE_SELL_AMOUNT",c.TRADE_SELL_AMOUNT);
+    // 授权额度: APPROVE_USD 有值=按U数; 否则按场数(APPROVE_ROUNDS)
+    if(c.APPROVE_USD!==undefined&&c.APPROVE_USD!==null){console.log("APPROVE_MODE=usd");put("APPROVE_USD",c.APPROVE_USD);}
+    else{console.log("APPROVE_MODE=rounds");put("APPROVE_ROUNDS",c.APPROVE_ROUNDS);}
   ' 2>/dev/null)
   # 兼容旧配置里 CLAIM_INTERVAL_MS 直接是毫秒
   [ -n "$WIZ_CLAIM" ] || WIZ_CLAIM=20
@@ -486,6 +494,7 @@ wiz_header() {
   echo "    灵活资金   : $(wiz_flex_text)"
   echo "    FTS 买入   : $(wiz_buy_text)"
   echo "    FTS 卖出   : $(wiz_sell_text)"
+  echo "    授权额度   : $(wiz_approve_text)"
   echo "    自动更新   : $(wiz_update_text)"
   echo "  ────────────────────────────────────────────────────"
 }
@@ -733,6 +742,42 @@ wiz_edit_sell() {
   sleep 1
 }
 
+wiz_approve_text() {
+  if [ "$WIZ_APPROVE_MODE" = "usd" ]; then
+    if [ "${WIZ_APPROVE_USD:-}" = "0" ]; then echo "按 U 数: 授权全部余额"; else echo "按 U 数: 每次授权 ${WIZ_APPROVE_USD:-未设} U"; fi
+  else
+    echo "按场数: 每次授权 ${WIZ_APPROVE_ROUNDS:-1} 场的票价"
+  fi
+}
+
+wiz_edit_approve() {
+  local ch v
+  wiz_header
+  echo "    ---- 授权额度 (USDT approve 的大小) ----"
+  echo "      每轮入场前都会检查授权，不足时自动补授权。这里决定补多少："
+  echo "        按场数: 授权 = 当前房间票价 x 场数 (例如 10U 房 x 3 场 = 30U)"
+  echo "        按 U 数: 授权 = 固定金额 (填 0 = 授权钱包全部 USDT 余额)"
+  echo "      额度越大，后续几轮越不用重复授权；额度越小，资金占用越少。"
+  echo "    当前: $(wiz_approve_text)"
+  echo "      [1] 按场数    [2] 按 U 数"
+  read -r -p "    请选择 [1/2]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  if [ "$ch" = "2" ]; then
+    WIZ_APPROVE_MODE="usd"
+    read -r -p "    每次授权多少 U (填 0 = 全部余额): " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
+    if [ -n "$v" ]; then
+      if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then WIZ_APPROVE_USD="$v"; else warn_msg "无效数字，保持原值"; fi
+    fi
+    [ -n "$WIZ_APPROVE_USD" ] || WIZ_APPROVE_USD="0"
+  else
+    WIZ_APPROVE_MODE="rounds"
+    read -r -p "    每次授权多少场的票价 (整数，默认 1): " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
+    if [ -n "$v" ]; then
+      if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 100 ]; then WIZ_APPROVE_ROUNDS="$v"; else warn_msg "需为 1~100 的整数，保持原值"; fi
+    fi
+  fi
+  sleep 1
+}
+
 # ---- 推荐人自动检测(读链上 referrerOfV2) ----
 detect_referrer() {
   printf '%s' "$1" | node -e '
@@ -864,6 +909,7 @@ wiz_defaults() {
       WIZ_FLEX="0"
       WIZ_BUY_ON="0"; WIZ_BUY_MAX_PRICE=""; WIZ_BUY_MAX_TOTAL=""
       WIZ_SELL_ON="0"; WIZ_SELL_MODE="fixed"; WIZ_SELL_PRICE=""; WIZ_SELL_AMOUNT=""
+      WIZ_APPROVE_MODE="rounds"; WIZ_APPROVE_ROUNDS="1"; WIZ_APPROVE_USD=""
       ok_msg "已恢复默认(尚未保存)" ;;
     *) echo "    已取消" ;;
   esac
@@ -884,6 +930,7 @@ wiz_commit() {
   WIZ_FLEX="$WIZ_FLEX" \
   WIZ_BUY_ON="$WIZ_BUY_ON" WIZ_BUY_MAX_PRICE="$WIZ_BUY_MAX_PRICE" WIZ_BUY_MAX_TOTAL="$WIZ_BUY_MAX_TOTAL" \
   WIZ_SELL_ON="$WIZ_SELL_ON" WIZ_SELL_MODE="$WIZ_SELL_MODE" WIZ_SELL_PRICE="$WIZ_SELL_PRICE" WIZ_SELL_AMOUNT="$WIZ_SELL_AMOUNT" \
+  WIZ_APPROVE_MODE="$WIZ_APPROVE_MODE" WIZ_APPROVE_ROUNDS="$WIZ_APPROVE_ROUNDS" WIZ_APPROVE_USD="$WIZ_APPROVE_USD" \
   WIZ_UPDATE_TOKEN="$WIZ_UPDATE_TOKEN" \
   node -e '
     const fs = require("fs");
@@ -922,6 +969,14 @@ wiz_commit() {
     else delete c.TRADE_SELL_PRICE;
     if (String(e.WIZ_SELL_AMOUNT || "").trim() !== "") c.TRADE_SELL_AMOUNT = Number(e.WIZ_SELL_AMOUNT);
     else delete c.TRADE_SELL_AMOUNT;
+    // 授权额度: 按U数写 APPROVE_USD(删 APPROVE_ROUNDS)；按场数反之
+    if (String(e.WIZ_APPROVE_MODE) === "usd") {
+      c.APPROVE_USD = Number(String(e.WIZ_APPROVE_USD || "0").trim() || 0);
+      delete c.APPROVE_ROUNDS;
+    } else {
+      c.APPROVE_ROUNDS = Math.max(1, Math.floor(Number(e.WIZ_APPROVE_ROUNDS || 1)));
+      delete c.APPROVE_USD;
+    }
     const tmp = "config.json.tmp";
     fs.writeFileSync(tmp, JSON.stringify(c, null, 2) + "\n");
     // rename 失败时清掉 .tmp，别在目录里留垃圾
@@ -965,6 +1020,7 @@ wiz_menu() {
   echo "      [9] 中奖处理/组矿机   [10] 自动更新"
   echo "      [11] 灵活资金决策     [12] 保存并退出"
   echo "      [13] FTS自动买入      [14] FTS自动卖出"
+  echo "      [15] 授权额度"
   echo "      [0] 不保存退出"
   echo "  ────────────────────────────────────────────────────"
 }
@@ -990,6 +1046,7 @@ wizard_main() {
       11) wiz_edit_flex ;;
       13) wiz_edit_buy ;;
       14) wiz_edit_sell ;;
+      15) wiz_edit_approve ;;
       12) if wiz_commit; then return 0; fi ;;
       0) echo ""; echo "  已退出，未做任何修改"; return 1 ;;
       *) ;;

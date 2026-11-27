@@ -427,6 +427,7 @@ $Script:WizFlex = '0'
 $Script:WizUpdateToken = ''
 $Script:WizBuyOn = '0'; $Script:WizBuyMaxPrice = ''; $Script:WizBuyMaxTotal = ''
 $Script:WizSellOn = '0'; $Script:WizSellMode = 'fixed'; $Script:WizSellPrice = ''; $Script:WizSellAmount = ''
+$Script:WizApproveMode = 'rounds'; $Script:WizApproveRounds = '1'; $Script:WizApproveUsd = ''
 $Script:WizAccountCount = -1   # -1 = 未缓存；每次重绘都起 node 会明显卡顿
 $Script:WizAccountStamp = [datetime]::MinValue   # 缓存时 wallets.json 的 mtime
 
@@ -463,6 +464,8 @@ console.log("TRADE_SELL="+(c.TRADE_SELL_ENABLED===true||c.TRADE_SELL_ENABLED==="
 put("TRADE_SELL_MODE",c.TRADE_SELL_MODE);
 put("TRADE_SELL_PRICE",c.TRADE_SELL_PRICE);
 put("TRADE_SELL_AMOUNT",c.TRADE_SELL_AMOUNT);
+if(c.APPROVE_USD!==undefined&&c.APPROVE_USD!==null){console.log("APPROVE_MODE=usd");put("APPROVE_USD",c.APPROVE_USD);}
+else{console.log("APPROVE_MODE=rounds");put("APPROVE_ROUNDS",c.APPROVE_ROUNDS);}
 '@
     $lines = Invoke-NodeJs 'cfg-read' $code
     foreach ($l in $lines) {
@@ -500,6 +503,9 @@ put("TRADE_SELL_AMOUNT",c.TRADE_SELL_AMOUNT);
                 'TRADE_SELL_MODE'   { if ($v -in @('fixed','spotminus')) { $Script:WizSellMode = $v } }
                 'TRADE_SELL_PRICE'  { if (Test-IsNum $v) { $Script:WizSellPrice = $v } }
                 'TRADE_SELL_AMOUNT' { if (Test-IsNum $v) { $Script:WizSellAmount = $v } }
+                'APPROVE_MODE'      { if ($v -in @('rounds','usd')) { $Script:WizApproveMode = $v } }
+                'APPROVE_ROUNDS'    { if (Test-IsNum $v) { $Script:WizApproveRounds = $v } }
+                'APPROVE_USD'       { if (Test-IsNum $v) { $Script:WizApproveUsd = $v } }
             }
         }
     }
@@ -639,6 +645,37 @@ function Edit-Sell {
     if (Test-IsNum $v) { $Script:WizSellAmount = $v } elseif ($v) { Write-WarnMsg "无效数字，保持原值" }
 }
 
+function Get-ApproveText {
+    if ($Script:WizApproveMode -eq 'usd') {
+        if ($Script:WizApproveUsd -eq '0') { return '按 U 数: 授权全部余额' }
+        $u = if ($Script:WizApproveUsd) { $Script:WizApproveUsd } else { '未设' }
+        return "按 U 数: 每次授权 ${u} U"
+    }
+    return "按场数: 每次授权 $($Script:WizApproveRounds) 场的票价"
+}
+function Edit-Approve {
+    Show-WizHeader
+    Write-Host "    ---- 授权额度 (USDT approve 的大小) ----"
+    Write-Host "      每轮入场前都会检查授权，不足时自动补授权。这里决定补多少："
+    Write-Host "        按场数: 授权 = 当前房间票价 x 场数 (例如 10U 房 x 3 场 = 30U)"
+    Write-Host "        按 U 数: 授权 = 固定金额 (填 0 = 授权钱包全部 USDT 余额)"
+    Write-Host "      额度越大，后续几轮越不用重复授权；额度越小，资金占用越少。"
+    Write-Host "    当前: $(Get-ApproveText)"
+    Write-Host "      [1] 按场数    [2] 按 U 数"
+    $ch = Read-Menu "    请选择 [1/2]"
+    if ($ch -eq '2') {
+        $Script:WizApproveMode = 'usd'
+        $v = Read-Menu "    每次授权多少 U (填 0 = 全部余额)"
+        if (Test-IsNum $v) { $Script:WizApproveUsd = $v } elseif ($v) { Write-WarnMsg "无效数字，保持原值" }
+        if (-not $Script:WizApproveUsd) { $Script:WizApproveUsd = '0' }
+    } else {
+        $Script:WizApproveMode = 'rounds'
+        $v = Read-Menu "    每次授权多少场的票价 (整数，默认 1)"
+        if ($v -match '^\d+$' -and [int]$v -ge 1 -and [int]$v -le 100) { $Script:WizApproveRounds = $v }
+        elseif ($v) { Write-WarnMsg "需为 1~100 的整数，保持原值" }
+    }
+}
+
 function Get-ClaimWinText {
     if ($Script:WizClaimWin -eq '1') { return '中奖后自动领取矿机额度' }
     return '中奖后不领取(放弃该奖励)'
@@ -677,6 +714,7 @@ function Show-WizHeader {
     Write-Host "    灵活资金   : $(Get-FlexText)"
     Write-Host "    FTS 买入   : $(Get-BuyText)"
     Write-Host "    FTS 卖出   : $(Get-SellText)"
+    Write-Host "    授权额度   : $(Get-ApproveText)"
     Write-Host "    自动更新   : $(Get-UpdateText)"
     Write-Host "  ----------------------------------------------------"
 }
@@ -966,6 +1004,7 @@ function Reset-Defaults {
         $Script:WizFlex = '0'
         $Script:WizBuyOn = '0'; $Script:WizBuyMaxPrice = ''; $Script:WizBuyMaxTotal = ''
         $Script:WizSellOn = '0'; $Script:WizSellMode = 'fixed'; $Script:WizSellPrice = ''; $Script:WizSellAmount = ''
+        $Script:WizApproveMode = 'rounds'; $Script:WizApproveRounds = '1'; $Script:WizApproveUsd = ''
         Write-Ok "已恢复默认(尚未保存)"
     } else {
         Write-Host "    已取消"
@@ -999,6 +1038,9 @@ function Save-Wiz {
     $env:WIZ_SELL_MODE = $Script:WizSellMode
     $env:WIZ_SELL_PRICE = $Script:WizSellPrice
     $env:WIZ_SELL_AMOUNT = $Script:WizSellAmount
+    $env:WIZ_APPROVE_MODE = $Script:WizApproveMode
+    $env:WIZ_APPROVE_ROUNDS = $Script:WizApproveRounds
+    $env:WIZ_APPROVE_USD = $Script:WizApproveUsd
     $env:WIZ_UPDATE_TOKEN = $Script:WizUpdateToken
 
     $code = @'
@@ -1033,13 +1075,16 @@ c.TRADE_SELL_ENABLED=String(e.WIZ_SELL_ON)==="1";
 c.TRADE_SELL_MODE=String(e.WIZ_SELL_MODE||"fixed");
 if(String(e.WIZ_SELL_PRICE||"").trim()!=="")c.TRADE_SELL_PRICE=Number(e.WIZ_SELL_PRICE);else delete c.TRADE_SELL_PRICE;
 if(String(e.WIZ_SELL_AMOUNT||"").trim()!=="")c.TRADE_SELL_AMOUNT=Number(e.WIZ_SELL_AMOUNT);else delete c.TRADE_SELL_AMOUNT;
+// 授权额度: 按U数写 APPROVE_USD(删 APPROVE_ROUNDS)；按场数反之
+if(String(e.WIZ_APPROVE_MODE)==="usd"){c.APPROVE_USD=Number(String(e.WIZ_APPROVE_USD||"0").trim()||0);delete c.APPROVE_ROUNDS;}
+else{c.APPROVE_ROUNDS=Math.max(1,Math.floor(Number(e.WIZ_APPROVE_ROUNDS||1)));delete c.APPROVE_USD;}
 const tmp="config.json.tmp";
 fs.writeFileSync(tmp,JSON.stringify(c,null,2)+"\n");
 try { fs.renameSync(tmp,"config.json"); } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch(e){} } }
 '@
     $null = Invoke-NodeJs 'cfg-write' $code
     $rc = $Script:LastNodeExit
-    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_MINER_MODE','WIZ_CLAIM_WIN','WIZ_FLEX','WIZ_BUY_ON','WIZ_BUY_MAX_PRICE','WIZ_BUY_MAX_TOTAL','WIZ_SELL_ON','WIZ_SELL_MODE','WIZ_SELL_PRICE','WIZ_SELL_AMOUNT') {
+    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_MINER_MODE','WIZ_CLAIM_WIN','WIZ_FLEX','WIZ_BUY_ON','WIZ_BUY_MAX_PRICE','WIZ_BUY_MAX_TOTAL','WIZ_SELL_ON','WIZ_SELL_MODE','WIZ_SELL_PRICE','WIZ_SELL_AMOUNT','WIZ_APPROVE_MODE','WIZ_APPROVE_ROUNDS','WIZ_APPROVE_USD') {
         Remove-Item "Env:$k" -ErrorAction SilentlyContinue
     }
     if ($rc -ne 0) { Write-WarnMsg "写入 config.json 失败"; Start-Sleep -Seconds 1; return $false }
@@ -1084,6 +1129,7 @@ function Invoke-Wizard {
         Write-Host "      [9] 中奖处理/组矿机   [10] 自动更新"
         Write-Host "      [11] 灵活资金决策     [12] 保存并退出"
         Write-Host "      [13] FTS自动买入      [14] FTS自动卖出"
+        Write-Host "      [15] 授权额度"
         Write-Host "      [0] 不保存退出"
         Write-Host "  ----------------------------------------------------"
         $ch = Read-Menu "    请选择"
@@ -1101,6 +1147,7 @@ function Invoke-Wizard {
             '11' { Edit-Flex }
             '13' { Edit-Buy }
             '14' { Edit-Sell }
+            '15' { Edit-Approve }
             '12' { if (Save-Wiz) { return $true } }
             '0' { Write-Host ""; Write-Host "  已退出，未做任何修改"; return $false }
         }
