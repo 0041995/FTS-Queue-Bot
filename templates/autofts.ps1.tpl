@@ -139,6 +139,8 @@ function Show-Usage {
   --run        正式运行(默认)
   --init       打开配置向导(房间/抢位区间/延迟/手续费/账号)，配完即退出
   --settings   同 --init，随时回来改设置
+  --encrypt    加密 wallets.json(设置密码，运行时用 FTS_WALLET_PASSWORD 提供)
+  --sync-web   从游戏网页自动读取最新合约地址写入配置(换合约不用改代码)
   --update     一键更新到最新版本(原地替换脚本，支持私有仓库)
   --stop       停止后台运行的引擎
   --help       查看本帮助
@@ -257,6 +259,8 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     elseif ($a -eq '--selftest') { $Mode = 'selftest' }
     elseif ($a -eq '--dry-run')  { $Mode = 'dry-run' }
     elseif ($a -eq '--run')      { $Mode = 'run' }
+    elseif ($a -eq '--encrypt')  { $Mode = 'encrypt' }
+    elseif ($a -eq '--sync-web') { $Mode = 'sync-web' }
     elseif ($a -eq '--init')     { $DoInit = $true }
     elseif ($a -eq '--settings') { $DoWizard = $true }
     elseif ($a -eq '--update')   { $Mode = 'update' }
@@ -379,6 +383,18 @@ if ($LASTEXITCODE -ne 0) { Write-Die "probe.js 生成异常(语法错误)" }
 if ($LASTEXITCODE -ne 0) { Write-Die "update.js 生成异常(语法错误)" }
 Write-Ok "核心引擎 core.js + 只读探针 probe.js + 更新器 update.js 已写入"
 
+# --encrypt / --sync-web 都在"要求输入私钥"的向导之前退出
+if ($Mode -eq 'encrypt') {
+    Write-Host ""
+    & $Script:NodeExe core.js encrypt
+    exit $LASTEXITCODE
+}
+if ($Mode -eq 'sync-web') {
+    Write-Host ""
+    & $Script:NodeExe core.js sync-web
+    exit $LASTEXITCODE
+}
+
 # --probe 是纯只读探测，必须在"要求输入私钥"之前退出
 if ($Mode -eq 'probe') {
     # 和 bash 版对齐: 别把 --help 之类的开关当成合约地址传给 probe.js
@@ -409,6 +425,8 @@ $Script:WizClaim = '20'; $Script:WizBnb = '0.005'
 $Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizMinerMode = 'old'; $Script:WizClaimWin = '1'
 $Script:WizFlex = '0'
 $Script:WizUpdateToken = ''
+$Script:WizBuyOn = '0'; $Script:WizBuyMaxPrice = ''; $Script:WizBuyMaxTotal = ''
+$Script:WizSellOn = '0'; $Script:WizSellMode = 'fixed'; $Script:WizSellPrice = ''; $Script:WizSellAmount = ''
 $Script:WizAccountCount = -1   # -1 = 未缓存；每次重绘都起 node 会明显卡顿
 $Script:WizAccountStamp = [datetime]::MinValue   # 缓存时 wallets.json 的 mtime
 
@@ -438,6 +456,13 @@ put("MINER_USD",c.MINER_USD);
 console.log("CLAIM_WIN="+(c.CLAIM_WIN===false||c.CLAIM_WIN===0||c.CLAIM_WIN==="0"||c.CLAIM_WIN==="false"?"0":"1"));
 put("MINER_MODE",c.MINER_MODE);
 console.log("FLEX="+(c.FLEX_DECISION===true||c.FLEX_DECISION==="true"||c.FLEX_DECISION===1?"1":"0"));
+console.log("TRADE_BUY="+(c.TRADE_BUY_ENABLED===true||c.TRADE_BUY_ENABLED==="true"||c.TRADE_BUY_ENABLED===1?"1":"0"));
+put("TRADE_BUY_MAX_PRICE",c.TRADE_BUY_MAX_PRICE);
+put("TRADE_BUY_MAX_TOTAL",c.TRADE_BUY_MAX_TOTAL);
+console.log("TRADE_SELL="+(c.TRADE_SELL_ENABLED===true||c.TRADE_SELL_ENABLED==="true"||c.TRADE_SELL_ENABLED===1?"1":"0"));
+put("TRADE_SELL_MODE",c.TRADE_SELL_MODE);
+put("TRADE_SELL_PRICE",c.TRADE_SELL_PRICE);
+put("TRADE_SELL_AMOUNT",c.TRADE_SELL_AMOUNT);
 '@
     $lines = Invoke-NodeJs 'cfg-read' $code
     foreach ($l in $lines) {
@@ -468,6 +493,13 @@ console.log("FLEX="+(c.FLEX_DECISION===true||c.FLEX_DECISION==="true"||c.FLEX_DE
                 'UPDATE_TOKEN'      { $Script:WizUpdateToken = $v }
                 'MINER_MODE'        { if ($v -in @('old','new','both')) { $Script:WizMinerMode = $v } }
                 'FLEX'              { if ($v -eq '1') { $Script:WizFlex = '1' } else { $Script:WizFlex = '0' } }
+                'TRADE_BUY'         { if ($v -eq '1') { $Script:WizBuyOn = '1' } else { $Script:WizBuyOn = '0' } }
+                'TRADE_BUY_MAX_PRICE' { if (Test-IsNum $v) { $Script:WizBuyMaxPrice = $v } }
+                'TRADE_BUY_MAX_TOTAL' { if (Test-IsNum $v) { $Script:WizBuyMaxTotal = $v } }
+                'TRADE_SELL'        { if ($v -eq '1') { $Script:WizSellOn = '1' } else { $Script:WizSellOn = '0' } }
+                'TRADE_SELL_MODE'   { if ($v -in @('fixed','spotminus')) { $Script:WizSellMode = $v } }
+                'TRADE_SELL_PRICE'  { if (Test-IsNum $v) { $Script:WizSellPrice = $v } }
+                'TRADE_SELL_AMOUNT' { if (Test-IsNum $v) { $Script:WizSellAmount = $v } }
             }
         }
     }
@@ -549,6 +581,64 @@ function Edit-Flex {
     if ($ans -eq '1') { $Script:WizFlex = '1' } else { $Script:WizFlex = '0' }
 }
 
+function Get-BuyText {
+    if ($Script:WizBuyOn -eq '1') {
+        $p = if ($Script:WizBuyMaxPrice) { $Script:WizBuyMaxPrice } else { '未设' }
+        $t = if ($Script:WizBuyMaxTotal) { $Script:WizBuyMaxTotal } else { '未设' }
+        return "开启 (单价<=${p}U, 总额<=${t}U)"
+    }
+    return '关闭'
+}
+function Edit-Buy {
+    Show-WizHeader
+    Write-Host "    ---- FTS 自动买入 (默认关闭) ----"
+    Write-Host "      监控市场挂单，单价低于你设定值时代为吃单；总额不超过上限。"
+    Write-Host "      阈值不设默认值，必须自己填。"
+    Write-Host "    当前: $(Get-BuyText)"
+    Write-Host "      [1] 开启/修改    [2] 关闭"
+    $ans = Read-Menu "    请选择 [1/2]"
+    if ($ans -ne '1') { $Script:WizBuyOn = '0'; return }
+    $Script:WizBuyOn = '1'
+    $v = Read-Menu "    最高买入单价 (USDT/FTS，如 0.45，留空不设)"
+    if (Test-IsNum $v) { $Script:WizBuyMaxPrice = $v } elseif ($v) { Write-WarnMsg "无效数字，保持原值" }
+    $v = Read-Menu "    买入总额上限 (USDT，留空不设)"
+    if (Test-IsNum $v) { $Script:WizBuyMaxTotal = $v } elseif ($v) { Write-WarnMsg "无效数字，保持原值" }
+}
+
+function Get-SellText {
+    if ($Script:WizSellOn -eq '1') {
+        $p = if ($Script:WizSellPrice) { $Script:WizSellPrice } else { '未设' }
+        $a = if ($Script:WizSellAmount) { $Script:WizSellAmount } else { '未设' }
+        if ($Script:WizSellMode -eq 'fixed') { return "开启 (固定价 ${p}U, 数量 ${a} FTS)" }
+        return "开启 (时价减 ${p}U, 数量 ${a} FTS)"
+    }
+    return '关闭'
+}
+function Edit-Sell {
+    Show-WizHeader
+    Write-Host "    ---- FTS 自动卖出 (默认关闭) ----"
+    Write-Host "      读取 FTS 真实价格(DEX池储备，不读市场挂单价)。达到条件时自动挂单。"
+    Write-Host "      阈值不设默认值，必须自己填。"
+    Write-Host "    当前: $(Get-SellText)"
+    Write-Host "      [1] 开启/修改    [2] 关闭"
+    $ans = Read-Menu "    请选择 [1/2]"
+    if ($ans -ne '1') { $Script:WizSellOn = '0'; return }
+    $Script:WizSellOn = '1'
+    Write-Host "      卖出价模式:"
+    Write-Host "        [1] 固定价: 真实价 >= 你设的值时，按该价挂单"
+    Write-Host "        [2] 时价减差值: 挂单价 = 真实价 - 你设的差值"
+    $m = Read-Menu "    请选择 [1/2]"
+    if ($m -eq '2') { $Script:WizSellMode = 'spotminus' } else { $Script:WizSellMode = 'fixed' }
+    if ($Script:WizSellMode -eq 'fixed') {
+        $v = Read-Menu "    固定卖出单价 (USDT/FTS，留空不设)"
+    } else {
+        $v = Read-Menu "    时价减多少 (USDT/FTS，如 0.02，留空不设)"
+    }
+    if (Test-IsNum $v) { $Script:WizSellPrice = $v } elseif ($v) { Write-WarnMsg "无效数字，保持原值" }
+    $v = Read-Menu "    卖出数量 (FTS，留空不设)"
+    if (Test-IsNum $v) { $Script:WizSellAmount = $v } elseif ($v) { Write-WarnMsg "无效数字，保持原值" }
+}
+
 function Get-ClaimWinText {
     if ($Script:WizClaimWin -eq '1') { return '中奖后自动领取矿机额度' }
     return '中奖后不领取(放弃该奖励)'
@@ -585,6 +675,8 @@ function Show-WizHeader {
     Write-Host "    组矿机     : $(Get-MinerText)"
     Write-Host "    中奖处理   : $(Get-ClaimWinText)"
     Write-Host "    灵活资金   : $(Get-FlexText)"
+    Write-Host "    FTS 买入   : $(Get-BuyText)"
+    Write-Host "    FTS 卖出   : $(Get-SellText)"
     Write-Host "    自动更新   : $(Get-UpdateText)"
     Write-Host "  ----------------------------------------------------"
 }
@@ -872,6 +964,8 @@ function Reset-Defaults {
         $Script:WizClaim = '20'; $Script:WizBnb = '0.005'
         $Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizMinerMode = 'old'; $Script:WizClaimWin = '1'
         $Script:WizFlex = '0'
+        $Script:WizBuyOn = '0'; $Script:WizBuyMaxPrice = ''; $Script:WizBuyMaxTotal = ''
+        $Script:WizSellOn = '0'; $Script:WizSellMode = 'fixed'; $Script:WizSellPrice = ''; $Script:WizSellAmount = ''
         Write-Ok "已恢复默认(尚未保存)"
     } else {
         Write-Host "    已取消"
@@ -898,6 +992,13 @@ function Save-Wiz {
     $env:WIZ_CLAIM_WIN = $Script:WizClaimWin
     $env:WIZ_MINER_MODE = $Script:WizMinerMode
     $env:WIZ_FLEX = $Script:WizFlex
+    $env:WIZ_BUY_ON = $Script:WizBuyOn
+    $env:WIZ_BUY_MAX_PRICE = $Script:WizBuyMaxPrice
+    $env:WIZ_BUY_MAX_TOTAL = $Script:WizBuyMaxTotal
+    $env:WIZ_SELL_ON = $Script:WizSellOn
+    $env:WIZ_SELL_MODE = $Script:WizSellMode
+    $env:WIZ_SELL_PRICE = $Script:WizSellPrice
+    $env:WIZ_SELL_AMOUNT = $Script:WizSellAmount
     $env:WIZ_UPDATE_TOKEN = $Script:WizUpdateToken
 
     $code = @'
@@ -924,13 +1025,21 @@ c.FLEX_GAS_POOLING=c.FLEX_DECISION;
 c.FLEX_FUND_AGGREGATION=c.FLEX_DECISION;
 c.UPDATE_TOKEN=String(e.WIZ_UPDATE_TOKEN||"").trim();
 c.AUTO_UPDATE=c.UPDATE_TOKEN.length>0;
+// FTS 自动买卖: 开关默认关；阈值只在用户填了才写入(不设默认值)
+c.TRADE_BUY_ENABLED=String(e.WIZ_BUY_ON)==="1";
+if(String(e.WIZ_BUY_MAX_PRICE||"").trim()!=="")c.TRADE_BUY_MAX_PRICE=Number(e.WIZ_BUY_MAX_PRICE);else delete c.TRADE_BUY_MAX_PRICE;
+if(String(e.WIZ_BUY_MAX_TOTAL||"").trim()!=="")c.TRADE_BUY_MAX_TOTAL=Number(e.WIZ_BUY_MAX_TOTAL);else delete c.TRADE_BUY_MAX_TOTAL;
+c.TRADE_SELL_ENABLED=String(e.WIZ_SELL_ON)==="1";
+c.TRADE_SELL_MODE=String(e.WIZ_SELL_MODE||"fixed");
+if(String(e.WIZ_SELL_PRICE||"").trim()!=="")c.TRADE_SELL_PRICE=Number(e.WIZ_SELL_PRICE);else delete c.TRADE_SELL_PRICE;
+if(String(e.WIZ_SELL_AMOUNT||"").trim()!=="")c.TRADE_SELL_AMOUNT=Number(e.WIZ_SELL_AMOUNT);else delete c.TRADE_SELL_AMOUNT;
 const tmp="config.json.tmp";
 fs.writeFileSync(tmp,JSON.stringify(c,null,2)+"\n");
 try { fs.renameSync(tmp,"config.json"); } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch(e){} } }
 '@
     $null = Invoke-NodeJs 'cfg-write' $code
     $rc = $Script:LastNodeExit
-    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_MINER_MODE','WIZ_CLAIM_WIN','WIZ_FLEX') {
+    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_MINER_MODE','WIZ_CLAIM_WIN','WIZ_FLEX','WIZ_BUY_ON','WIZ_BUY_MAX_PRICE','WIZ_BUY_MAX_TOTAL','WIZ_SELL_ON','WIZ_SELL_MODE','WIZ_SELL_PRICE','WIZ_SELL_AMOUNT') {
         Remove-Item "Env:$k" -ErrorAction SilentlyContinue
     }
     if ($rc -ne 0) { Write-WarnMsg "写入 config.json 失败"; Start-Sleep -Seconds 1; return $false }
@@ -974,6 +1083,7 @@ function Invoke-Wizard {
         Write-Host "      [7] 账号管理          [8] 恢复默认值"
         Write-Host "      [9] 中奖处理/组矿机   [10] 自动更新"
         Write-Host "      [11] 灵活资金决策     [12] 保存并退出"
+        Write-Host "      [13] FTS自动买入      [14] FTS自动卖出"
         Write-Host "      [0] 不保存退出"
         Write-Host "  ----------------------------------------------------"
         $ch = Read-Menu "    请选择"
@@ -989,6 +1099,8 @@ function Invoke-Wizard {
             '9' { Edit-Miner }
             '10' { Edit-Update }
             '11' { Edit-Flex }
+            '13' { Edit-Buy }
+            '14' { Edit-Sell }
             '12' { if (Save-Wiz) { return $true } }
             '0' { Write-Host ""; Write-Host "  已退出，未做任何修改"; return $false }
         }

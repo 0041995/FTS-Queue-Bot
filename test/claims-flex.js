@@ -136,10 +136,11 @@ const mkRevert = (msg) => ({
       withTimeout: (p) => p,
       sendTx: async (from, opt) => { sends.push({ from: from.address, opt }); return true; }
     };
-    const api = build(
-      ['async function pickFlexDonor(inst, asset, shortWei) {', 'async function flexSendNative(fromInst, to, amtWei) {', 'async function tryFlexTopUp(inst, needUsdtWei, needGasWei) {'],
-      stubs
-    );
+    const flexStart = text.indexOf('const flexReserved');
+    const flexEnd = text.indexOf('async function ensureFunds', flexStart);
+    if (flexStart < 0 || flexEnd < 0) throw new Error('FLEX 代码段结构变了');
+    const body = text.slice(flexStart, flexEnd) + '\nreturn { pickFlexDonor, flexSendNative, tryFlexTopUp };';
+    const api = new Function(...Object.keys(stubs), body)(...Object.values(stubs));
     return { api, sends };
   };
   const acct = (addr, { usdt, bnb }) => ({
@@ -211,12 +212,15 @@ const mkRevert = (msg) => ({
         return true;
       }
     };
-    const api = build([
-      'async function pickFlexDonor(inst, asset, shortWei) {',
-      'async function flexSendNative(fromInst, to, amtWei) {',
-      'async function tryFlexTopUp(inst, needUsdtWei, needGasWei) {',
-      'async function ensureFunds(inst, ticketPrice, room) {'
-    ], stubs);
+    // FLEX 辅助定义(预留表/节流/选donor/转账/凑单)是一整段，直接按起止标记抽取，
+    // 避免只抽函数而漏掉 const 声明导致 ReferenceError。
+    const flexStart = text.indexOf('const flexReserved');
+    const flexEnd = text.indexOf('async function ensureFunds', flexStart);
+    if (flexStart < 0 || flexEnd < 0) throw new Error('FLEX 代码段结构变了');
+    const flexBlock = text.slice(flexStart, flexEnd);
+    const ensureSrc = extract('async function ensureFunds(inst, ticketPrice, room) {');
+    const body = flexBlock + '\n' + ensureSrc + '\nreturn { pickFlexDonor, flexSendNative, tryFlexTopUp, ensureFunds };';
+    const api = new Function(...Object.keys(stubs), body)(...Object.values(stubs));
     return { api, sends };
   };
   const mkA = (addr, balVar, bnb) => ({
@@ -249,6 +253,38 @@ const mkRevert = (msg) => ({
     const { api, sends } = mkEnsureFlex({ FLEX_ENABLED: true, FLEX_FUND_AGGREGATION: true }, A, B);
     await api.ensureFunds(A, U('10'), 0);
     check('开启但余额充足: 不触发转账(不足才触发)', sends.filter(s => s.opt.method === 'transfer').length === 0);
+  }
+
+  // ============ 3c. FLEX 边界加固 ============
+  console.log('\n--- 3c. FLEX 边界情况 ---');
+  { // donor 余额够 keep 但不够本次缺口 -> 不应选中(否则转不出来白烧 gas)
+    const A = mkA('0xA', { v: U('0') }, 1), B = mkA('0xB', { v: U('25') }, 1);  // B 保留20，可用5；A 缺10
+    const { api, sends } = mkEnsureFlex({ FLEX_ENABLED: true, FLEX_FUND_AGGREGATION: true }, A, B);
+    await api.ensureFunds(A, U('10'), 0);
+    check('donor 可用额不足缺口 -> 不转账', sends.filter(s => s.opt.method === 'transfer').length === 0);
+  }
+  { // 平分极限: A 5U、B 25U(keep20)，A 需要 10U -> B 只能出 5U，正好够
+    const A = mkA('0xA', { v: U('5') }, 1), B = mkA('0xB', { v: U('25') }, 1);
+    const { api, sends } = mkEnsureFlex({ FLEX_ENABLED: true, FLEX_FUND_AGGREGATION: true }, A, B);
+    await api.ensureFunds(A, U('10'), 0);
+    const tr = sends.find(s => s.opt.method === 'transfer');
+    check('平分极限: donor 刚好够缺口时转 5U', !!tr && tr.opt.args[1] === U('5'),
+      tr ? ethers.formatUnits(tr.opt.args[1], 18) : 'none');
+  }
+  { // 节流: 连续两次凑钱，第二次应被 30s 节流挡住(不重复扫/不重复转)
+    const A = mkA('0xA', { v: U('5') }, 1), B = mkA('0xB', { v: U('100') }, 1);
+    const { api, sends } = mkEnsureFlex({ FLEX_ENABLED: true, FLEX_FUND_AGGREGATION: true }, A, B);
+    await api.tryFlexTopUp(A, U('10'), 0n);
+    const n1 = sends.filter(s => s.opt.method === 'transfer').length;
+    await api.tryFlexTopUp(A, U('10'), 0n);   // 立刻第二次
+    const n2 = sends.filter(s => s.opt.method === 'transfer').length;
+    check('节流: 30s 内不重复发起凑钱', n1 === 1 && n2 === 1, `first=${n1} second=${n2}`);
+  }
+  { // 无 donor(只有一个账号) -> 不崩、不转账
+    const A = mkA('0xA', { v: U('5') }, 1);
+    const { api, sends } = mkEnsureFlex({ FLEX_ENABLED: true, FLEX_FUND_AGGREGATION: true }, A, null);
+    await api.tryFlexTopUp(A, U('10'), 0n);
+    check('无 donor -> 安全跳过不崩', sends.length === 0);
   }
 
   console.log('\n========================================');

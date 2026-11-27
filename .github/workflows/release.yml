@@ -66,6 +66,7 @@ jobs:
           node test/semaphore-concurrency.js 16
           node test/rate-limits.js
           node test/node-pool.js
+          node test/wallet-crypto.js
 
       - name: 生成校验和
         run: |

@@ -113,12 +113,12 @@ const CFG = {
       'https://bsc-dataseed2.bnbchain.org',     // A ~213ms
       'https://bsc-dataseed3.bnbchain.org',     // A ~228ms
       'https://bsc-dataseed4.bnbchain.org',     // A ~230ms
-      'https://bsc.api.pocket.network',         // B ~484ms
       'https://bsc.rpc.sentio.xyz',             // B ~498ms
       'https://bsc-mainnet.public.blastapi.io', // B ~538ms
       'https://bsc-rpc.publicnode.com',         // B ~545ms
       'https://rpc-bsc.48.club',                // B ~601ms
       'https://bsc.publicnode.com'              // B ~602ms
+      // pocket.network 单次~484ms 但高并发下频繁 429(实测 30 秒内 10 次)，剔除
     ], 'HTTP_POOL').map(s => String(s).trim()).filter(Boolean),
   WSS_POOL: process.env.FTS_WSS_POOL
     ? process.env.FTS_WSS_POOL.split(',').map(s => s.trim()).filter(Boolean)
@@ -159,6 +159,9 @@ const CFG = {
     return n;
   })(),
   GAS_LIMIT_CAP: cfgNum(process.env.FTS_GAS_CAP, 800000, 'GAS_LIMIT_CAP'),
+  // gasLimit 预估余量(%): 正常交易按 gasUsed 收费不受影响，但 revert 会烧掉整个 gasLimit。
+  // 105% 足够覆盖轻微状态变化，避免原 125% 在 revert 时多烧 20%。
+  GAS_LIMIT_BUFFER: cfgNum(process.env.FTS_GAS_BUFFER ?? userCfg.GAS_LIMIT_BUFFER, 105, 'GAS_LIMIT_BUFFER'),
   // 交易类型: auto=运行时探测链是否支持 EIP-1559 / 0=强制 Legacy / 2=强制 1559
   TX_TYPE: String(process.env.FTS_TX_TYPE || userCfg.TX_TYPE || 'auto').toLowerCase(),
   PRIORITY_MAX_GWEI: cfgNum(process.env.FTS_PRIORITY_GWEI ?? userCfg.PRIORITY_MAX_GWEI, 1.5, 'PRIORITY_MAX_GWEI'),
@@ -230,8 +233,38 @@ const CFG = {
     if (raw === undefined || raw === null || raw === '') return true;
     return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
   })(),
+  // 游戏网址: 用于从网页自动探测最新合约地址(网页换合约时无需改代码)
+  GAME_URL: cfgStr(process.env.FTS_GAME_URL ?? userCfg.GAME_URL, 'https://fatris.fans/dapp/game', 'GAME_URL'),
+  MARKET_URL: cfgStr(process.env.FTS_MARKET_URL ?? userCfg.MARKET_URL, 'https://fatris.fans/dapp/market', 'MARKET_URL'),
+  // 启动时自动同步网页合约(默认开)。关掉则只用 config.json 里的固定地址。
+  WEB_AUTO_SYNC: (() => {
+    const raw = process.env.FTS_WEB_SYNC ?? userCfg.WEB_AUTO_SYNC;
+    if (raw === undefined || raw === null || raw === '') return true;
+    return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
+  })(),
   // 启动排水: 等上一轮未确认交易落地，避免重启后 nonce 回退
   STARTUP_DRAIN_MS: cfgNum(process.env.FTS_DRAIN_MS, 30000, 'STARTUP_DRAIN_MS'),
+  // ---- FTS 自动买卖(两个独立开关，默认都关；阈值不设默认值，必须由用户显式配置) ----
+  // 买单: 监控市场挂单，单价 <= 阈值时吃单；累计花费有上限。
+  TRADE_BUY_ENABLED: (() => {
+    const raw = process.env.FTS_TRADE_BUY ?? userCfg.TRADE_BUY_ENABLED;
+    return raw === true || raw === 1 || raw === '1' || raw === 'true' || raw === 'on';
+  })(),
+  TRADE_BUY_MAX_PRICE: (() => { const v = process.env.FTS_BUY_MAX_PRICE ?? userCfg.TRADE_BUY_MAX_PRICE; const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; })(),
+  TRADE_BUY_MAX_TOTAL: (() => { const v = process.env.FTS_BUY_MAX_TOTAL ?? userCfg.TRADE_BUY_MAX_TOTAL; const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; })(),
+  TRADE_BUY_SCAN_N: cfgNum(process.env.FTS_BUY_SCAN_N ?? userCfg.TRADE_BUY_SCAN_N, 200, 'TRADE_BUY_SCAN_N'),
+  TRADE_CHECK_MS: cfgNum(process.env.FTS_TRADE_CHECK_MS ?? userCfg.TRADE_CHECK_MS, 15000, 'TRADE_CHECK_MS'),
+  // 卖单: 读 FTS 真实价格(DEX池储备，不读市场挂单价)，达到卖出条件时挂单。
+  TRADE_SELL_ENABLED: (() => {
+    const raw = process.env.FTS_TRADE_SELL ?? userCfg.TRADE_SELL_ENABLED;
+    return raw === true || raw === 1 || raw === '1' || raw === 'true' || raw === 'on';
+  })(),
+  // 卖出触发价模式: fixed=价格>=固定值; spotMinus=价格>=真实价-差值(即挂单价=真实价-差值)
+  TRADE_SELL_MODE: String(process.env.FTS_SELL_MODE ?? userCfg.TRADE_SELL_MODE ?? 'fixed').toLowerCase(),
+  TRADE_SELL_PRICE: (() => { const v = process.env.FTS_SELL_PRICE ?? userCfg.TRADE_SELL_PRICE; const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; })(),
+  TRADE_SELL_AMOUNT: (() => { const v = process.env.FTS_SELL_AMOUNT ?? userCfg.TRADE_SELL_AMOUNT; const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; })(),
+  // 市场合约地址(留空则从网页 VITE_MARKET_ESCROW 自动探测)
+  MARKET_ADDR: cfgStr(process.env.FTS_MARKET_ADDR ?? userCfg.MARKET_ADDR, '', 'MARKET_ADDR'),
   // ---- 灵活资金决策(多账号互相匀 gas / 凑 USDT) ----
   // 总开关，默认关闭：关闭时所有资金判断维持"单账号独立、不足即跳过"的原行为，零开销。
   FLEX_ENABLED: (() => {
@@ -575,17 +608,33 @@ class NodePool {
   // fn 第二个参数是选中的节点对象，供 RpcManager 在 429/失败时精准冷却该节点。
   async run(fn, preferred) {
     if (!this.enabled) return rpcGate.run(() => fn(this.nodes[0].provider, this.nodes[0]));
-    const node = this.pick(preferred);
+    // 重试时重新选节点: 排队等待期间原节点可能已被 429 冷却，不能在 acquire 后还打它
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const node = this.pick(preferred);
+      await node.gate.acquire();
+      // 关键: 拿到令牌后再确认节点仍可用。若排队期间被冷却，释放令牌重选，
+      // 否则已被冷却的节点仍会收到请求，导致同一节点被反复 429(实测会连续冷却 10 次)
+      if (!node.available && this.nodes.some(n => n.available)) {
+        node.gate.release();
+        preferred = null;
+        continue;
+      }
+      node.inflight++;
+      try {
+        const r = await fn(node.provider, node);
+        node.sent++;
+        return r;
+      } finally {
+        node.inflight--;
+        node.gate.release();
+      }
+    }
+    // 所有节点都在冷却: 兜底用负载最低的(总比卡死强)
+    const node = this.pick(null);
     await node.gate.acquire();
     node.inflight++;
-    try {
-      const r = await fn(node.provider, node);
-      node.sent++;
-      return r;
-    } finally {
-      node.inflight--;
-      node.gate.release();
-    }
+    try { return await fn(node.provider, node); }
+    finally { node.inflight--; node.gate.release(); }
   }
   cooldown(node, ms) { if (node) { node.cooldownUntil = Date.now() + (ms || 30000); } }
   stats() { return this.nodes.map(n => `${n.url.replace('https://','')}:${n.gate.max}/${n.inflight}${n.available ? '' : '(冷却)'}`).join(' '); }
@@ -1033,6 +1082,14 @@ function roomLabel(room, ticketPrice) {
 // 语义限制: 退款/空投只能由资格地址自己领(claim 退给 msg.sender)，脚本无法代领，
 // 因此"匀开/凑单"在这里实现为【从富余账号向本账号做真实链上转账】补 gas 或 USDT，
 // 转账本身的 gas 由 donor 承担。默认关闭，不开启不产生任何额外请求或交易。
+// FLEX 并发安全: 多账号可能同时向同一 donor 要钱，导致 donor 余额被重复计算而超支。
+// 用"预留"表记录正在转账中的金额，pickFlexDonor 计算可用余额时扣掉这部分。
+const flexReserved = new Map();   // address(lower) -> BigInt
+function flexReserve(addr, wei) { const k = addr.toLowerCase(); flexReserved.set(k, (flexReserved.get(k) || 0n) + wei); }
+function flexRelease(addr, wei) { const k = addr.toLowerCase(); const v = (flexReserved.get(k) || 0n) - wei; if (v > 0n) flexReserved.set(k, v); else flexReserved.delete(k); }
+
+// 找 donor: 返回 {inst, slack}。slack 已扣除 keep 保留额、本次缺口、以及正在转账中的预留额。
+// 严格判断 slack >= shortWei，避免"选了个余额不够的 donor"导致转账失败还白烧 gas。
 async function pickFlexDonor(inst, asset, shortWei) {
   const keep = asset === 'bnb'
     ? ethers.parseEther(String(CFG.FLEX_DONOR_KEEP_BNB))
@@ -1044,29 +1101,50 @@ async function pickFlexDonor(inst, asset, shortWei) {
       const bal = asset === 'bnb'
         ? await mgr.rpc(p => d.provider.getBalance(d.address))
         : await mgr.rpc(p => d.usdt.balanceOf(d.address));
-      const slack = bal - keep - shortWei;   // 扣掉 donor 自身保留额与本次转账开销余量
-      if (slack > 0n && slack > bestSlack) { best = d; bestSlack = slack; }
+      const reserved = flexReserved.get(String(d.address).toLowerCase()) || 0n;
+      // 可用 = 余额 - 保留额 - 已预留 - 本次缺口(保证 donor 自己还留得下 keep)
+      const slack = bal - keep - reserved;
+      // 关键: 必须够本次缺口，否则选了也转不出来
+      if (slack >= shortWei && slack > bestSlack) { best = d; bestSlack = slack; }
     } catch (e) { /* 该 donor 读失败，跳过 */ }
   }
-  return best;
+  return best ? { inst: best, slack: bestSlack } : null;
 }
+// 转 BNB: 必须显式带 nonce(和 inst.nonce 体系一致)，否则 ethers 自己读可能撞号
 async function flexSendNative(fromInst, to, amtWei) {
   const release = await fromInst.mutex.acquire();
   try {
     const fee = await buildFeeParams(1);
-    const nonce = await mgr.rpc(p => p.getTransactionCount(fromInst.address, 'pending'));
-    const tx = await withTimeout(fromInst.wallet.sendTransaction({ to, value: amtWei, gasLimit: 21000n, ...fee.tx }), 30000, 'flex-bnb');
+    const nonce = fromInst.nonce !== null
+      ? fromInst.nonce
+      : await mgr.rpc(p => p.getTransactionCount(fromInst.address, 'pending'));
+    const tx = await withTimeout(fromInst.wallet.sendTransaction({ to, value: amtWei, nonce, gasLimit: 21000n, ...fee.tx }), 30000, 'flex-bnb');
+    fromInst.nonce = nonce + 1;   // 立刻推进本地 nonce，避免后续交易撞号
     info(fromInst.address, `[灵活决策] 转 BNB 给 ${to} 已广播 ${tx.hash} (nonce=${nonce})`);
     try { await withTimeout(tx.wait(1, CFG.TX_WAIT_MS), CFG.TX_WAIT_MS + 10000, 'flex-bnb-wait'); } catch (e) { }
-    fromInst.nonce = null;
     return true;
-  } catch (e) { warnOnce(fromInst.address, `[灵活决策] 转 BNB 失败: ${formatError(e)}`, 60000); return false; }
+  } catch (e) { warnOnce(fromInst.address, `[灵活决策] 转 BNB 失败: ${formatError(e)}`, 60000); fromInst.nonce = null; return false; }
   finally { release(); }
+}
+// 节流: 同一账号对同一资产(USDT/BNB) 30 秒内只尝试一次凑钱，避免每轮扫全部 donor + 反复转账。
+// 也防止"两个账号互相都缺、互相转来转去"的抖动(转完仍不足时至少等 30s 再试)。
+const flexLastTry = new Map();   // key = addr:asset -> ts
+function flexThrottled(inst, asset) {
+  const k = inst.address + ':' + asset;
+  const now = Date.now();
+  if (now - (flexLastTry.get(k) || 0) < 30000) return true;
+  flexLastTry.set(k, now);
+  if (flexLastTry.size > 2000) { const t = now - 300000; for (const [kk, vv] of flexLastTry) if (vv < t) flexLastTry.delete(kk); }
+  return false;
 }
 async function tryFlexTopUp(inst, needUsdtWei, needGasWei) {
   if (!CFG.FLEX_ENABLED || DRY_RUN) return;
   const needGas = needGasWei || 0n;
   const needUsdt = needUsdtWei || 0n;
+  // 两个方向分别节流: 缺 USDT 和缺 BNB 是独立事件
+  const allowGas = CFG.FLEX_GAS_POOLING && needGas > 0n && !flexThrottled(inst, 'bnb');
+  const allowUsdt = CFG.FLEX_FUND_AGGREGATION && needUsdt > 0n && !flexThrottled(inst, 'usdt');
+  if (!allowGas && !allowUsdt) return;
   let bnbBal = 0n, usdtBal = 0n;
   try {
     [bnbBal, usdtBal] = await Promise.all([
@@ -1075,22 +1153,36 @@ async function tryFlexTopUp(inst, needUsdtWei, needGasWei) {
     ]);
   } catch (e) { return; }
   // 1) gas 匀开: 本账号 BNB 不足以发交易 -> 找 BNB 富余的 donor 转入差额
-  if (CFG.FLEX_GAS_POOLING && needGas > 0n && bnbBal < needGas) {
+  if (allowGas && bnbBal < needGas) {
     const short = needGas - bnbBal;
-    const donor = await pickFlexDonor(inst, 'bnb', short);
+    // 转账本身也要 gas: 多要 20% 覆盖 donor 的手续费波动，但不超过 donor 可用额度
+    const want = short + short / 5n;
+    const donor = await pickFlexDonor(inst, 'bnb', want);
     if (donor) {
-      const amt = short + short / 5n;   // 多转 20% 覆盖 donor 这次转账的 gas 波动
-      info(inst.address, `[灵活决策] BNB 不足(${ethers.formatEther(bnbBal)})，从 ${donor.address} 匀 ${ethers.formatEther(amt)} 作 gas`);
-      await flexSendNative(donor, inst.address, amt);
-    } else warnOnce(inst.address, '[灵活决策] 需匀 gas 但无 BNB 富余账号', 120000);
+      flexReserve(donor.inst.address, want);
+      info(inst.address, `[灵活决策] BNB 不足(${ethers.formatEther(bnbBal)})，从 ${donor.inst.address} 匀 ${ethers.formatEther(want)} 作 gas`);
+      const okSend = await flexSendNative(donor.inst, inst.address, want);
+      flexRelease(donor.inst.address, want);
+      if (okSend) {
+        // 验证到账: 转完重读，没到账就明确报错(不静默继续)
+        try {
+          const after = await mgr.rpc(p => inst.provider.getBalance(inst.address));
+          if (after <= bnbBal) warnOnce(inst.address, `[灵活决策] BNB 转账后余额未增加(可能还在确认)，本轮继续但下轮会重试`, 60000);
+          else inst.bnbCache = { at: Date.now(), v: after };
+        } catch (e) { }
+      }
+    } else warnOnce(inst.address, `[灵活决策] 需匀 ${ethers.formatEther(short)} BNB 但无账号有足够富余(已扣保留额/在途预留)`, 120000);
   }
   // 2) USDT 凑单: 本账号 USDT 单独不够、但存在富余 donor -> 转入差额
-  if (CFG.FLEX_FUND_AGGREGATION && needUsdt > 0n && usdtBal < needUsdt) {
+  if (allowUsdt && usdtBal < needUsdt) {
     const short = needUsdt - usdtBal;
     const donor = await pickFlexDonor(inst, 'usdt', short);
     if (donor) {
-      info(inst.address, `[灵活决策] USDT 不足(${ethers.formatUnits(usdtBal, 18)}U)，从 ${donor.address} 凑 ${ethers.formatUnits(short, 18)}U`);
-      await sendTx(donor, { label: `[灵活决策] 转 USDT 给 ${inst.address}`, contract: donor.usdt, method: 'transfer', args: [inst.address, short] });
+      flexReserve(donor.inst.address, short);
+      info(inst.address, `[灵活决策] USDT 不足(${ethers.formatUnits(usdtBal, 18)}U)，从 ${donor.inst.address} 凑 ${ethers.formatUnits(short, 18)}U`);
+      const okSend = await sendTx(donor.inst, { label: `[灵活决策] 转 USDT 给 ${inst.address}`, contract: donor.inst.usdt, method: 'transfer', args: [inst.address, short] });
+      flexRelease(donor.inst.address, short);
+      if (!okSend) warnOnce(inst.address, '[灵活决策] USDT 转账广播失败，本轮可能仍不足，下轮重试', 60000);
     } else warnOnce(inst.address, '[灵活决策] 需凑 USDT 但无单账号富余可匀出(或均不足)', 120000);
   }
 }
@@ -1394,7 +1486,14 @@ async function sendTx(inst, opt) {
             opt.contract[opt.method].estimateGas(...opt.args, { from: inst.address }),
             12000, 'estimateGas'
           );
-          gasLimit = (est * 125n) / 100n;
+          // gasLimit 余量: BSC 正常交易只按 gasUsed 收费，gasLimit 高低不影响正常花费；
+          // 但 revert 交易会烧掉整个 gasLimit。所以余量过大会放大 revert 损失。
+          // 105% 足够覆盖状态轻微变化，又不会让 revert 多烧 25%。(可配 GAS_LIMIT_BUFFER 调整)
+          const buf = Number.isFinite(CFG.GAS_LIMIT_BUFFER) && CFG.GAS_LIMIT_BUFFER >= 100 && CFG.GAS_LIMIT_BUFFER <= 200
+            ? BigInt(Math.round(CFG.GAS_LIMIT_BUFFER)) : 105n;
+          gasLimit = (est * buf) / 100n;
+          // 兜底下限: 太低的 gasLimit 会让正常交易 out-of-gas 反而更亏
+          if (gasLimit < est) gasLimit = est;
           if (gasLimit > BigInt(CFG.GAS_LIMIT_CAP)) gasLimit = BigInt(CFG.GAS_LIMIT_CAP);
         } catch (e) {
           // 业务 revert(人数已满/已入场/不在轮次) 很常见，直接放弃这一轮；
@@ -1692,6 +1791,25 @@ async function getRoundInfo(inst, room, r) {
   return rec;
 }
 
+// 领取失败退避: 同一 (房间,轮次) 反复 revert 时，避免每 20 秒重发一笔交易白烧 gas。
+// 连续失败次数越多，冷却越久(指数退避，封顶 30 分钟)。成功/业务终态会清除。
+const claimFail = new Map();   // key = address:room:round -> {n, until}
+function claimCooling(inst, ck) {
+  const k = inst.address + ':' + ck;
+  const v = claimFail.get(k);
+  return v && v.until > Date.now();
+}
+function claimMarkFail(inst, ck) {
+  const k = inst.address + ':' + ck;
+  const v = claimFail.get(k) || { n: 0, until: 0 };
+  v.n++;
+  // 1次=30s, 2次=2min, 3次=8min... 封顶30min
+  v.until = Date.now() + Math.min(30 * 60000, 30000 * Math.pow(4, v.n - 1));
+  claimFail.set(k, v);
+  if (claimFail.size > 3000) { const now = Date.now(); for (const [kk, vv] of claimFail) if (vv.until < now) claimFail.delete(kk); }
+}
+function claimClearFail(inst, ck) { claimFail.delete(inst.address + ':' + ck); }
+
 async function claimLoop(inst) {
   while (true) {
     try {
@@ -1717,6 +1835,8 @@ async function claimLoop(inst) {
           const ck = `${room}:${r}`;
           // 已处理过的轮次直接跳过，连 roundInfo 都不查 —— 这是省掉绝大部分请求的关键
           if (inst.claimed.has(ck)) continue;
+          // 连续 revert 的轮次在冷却期内跳过，避免每 20 秒重发交易白烧 gas
+          if (claimCooling(inst, ck)) continue;
           let rec;
           try { rec = await getRoundInfo(inst, room, r); }
           catch (e) {
@@ -1757,9 +1877,9 @@ async function claimLoop(inst) {
               method: 'claimWin',
               args: [room, r, 0],
               noWait: true,
-              onFailed: () => { inst.claimed.delete(ck); }
+              onFailed: () => { inst.claimed.delete(ck); claimMarkFail(inst, ck); }
             });
-            if (okWin) inst.claimed.add(ck);
+            if (okWin) { inst.claimed.add(ck); claimClearFail(inst, ck); }
             continue;
           }
 
@@ -1801,9 +1921,10 @@ async function claimLoop(inst) {
             method,
             args: [room, r],
             noWait: true,
-            onFailed: () => { inst.claimed.delete(ck); }  // 上链失败就撤标记，下轮重试
+            // 上链失败撤标记+退避: 撤标记保证不漏领，退避避免连续 revert 每 20 秒白烧 gas
+            onFailed: () => { inst.claimed.delete(ck); claimMarkFail(inst, ck); }
           });
-          if (okTx) inst.claimed.add(ck);
+          if (okTx) { inst.claimed.add(ck); claimClearFail(inst, ck); }
           else errOnce(inst.address, `[房间${room}] 轮次${r} 预检通过但广播未成功，已保留标记会在下一轮重试(不会漏领)`, 60000);
         }
       }
@@ -2134,76 +2255,93 @@ async function selftest() {
   // 复用 main 已经加载好的钱包列表，不再重复 loadWallets()(否则校验失败信息会打印两遍)
   const wallets = selftestWallets;
   if (!wallets.length) { fatal('CFG', 'wallets.json 中没有有效账号'); exitFlush(1); return; }
-  let allReady = true;
-  for (const w of wallets) {
-    console.log(`\n  账号 ${w.ADDRESS}`);
+  // selftest 是"合约+主账号体检"，不是"全账号余额审计"。
+  // 全部账号做本地校验(私钥/地址，零RPC)；只有第 1 个账号做链上余额/授权详细检查。
+  // 这样 100 账号也能秒级完成，而不是几分钟(每个账号 3+ 次 RPC)。
+  const roomCfgs = {};
+  for (const room of CFG.ROOMS) {
+    if (!roomOk[room]) continue;
+    roomCfgs[room] = await qRead.roomConfigs(room).catch(() => null);
+  }
+  const minBnb = ethers.parseEther(String(CFG.MIN_BNB_GAS));
+  console.log(`  （${wallets.length} 个账号：全部做本地校验，仅第 1 个做链上余额体检，避免几百次 RPC 拖慢自检）`);
+  const results = await Promise.all(wallets.map(async (w, wi) => {
+    const lines = [];
+    let ready = true;
+    lines.push(`\n  账号 ${w.ADDRESS}`);
     if (w.wallet.address.toLowerCase() !== w.ADDRESS.toLowerCase()) {
-      console.log('   ❌ 私钥与地址不匹配，跳过'); allReady = false; continue;
+      lines.push('   ❌ 私钥与地址不匹配，跳过');
+      return { lines, ready: false };
     }
-    const bnb = await mgr.rpc(p => p.getBalance(w.ADDRESS));
-    const usdt = await mgr.rpc(p => uRead.balanceOf(w.ADDRESS));
-    const allow = await mgr.rpc(p => uRead.allowance(w.ADDRESS, CFG.QUEUE_ADDR));
-    console.log(`   BNB=${ethers.formatEther(bnb)} | USDT=${ethers.formatUnits(usdt, 18)} | 已授权=${ethers.formatUnits(allow, 18)} (单轮授权模式)`);
-    // 阈值必须跟 CFG.MIN_BNB_GAS 一致，否则会出现"selftest 说够、跑起来说偏低"的分裂
-    const minBnb = ethers.parseEther(String(CFG.MIN_BNB_GAS));
-    if (bnb < minBnb) {
-      console.log(`   ❌ BNB 不足(当前 ${ethers.formatEther(bnb)} < 阈值 ${CFG.MIN_BNB_GAS})，无法支付 gas，所有交易都会失败`);
-      allReady = false;
-    } else if (bnb < minBnb * 3n) {
-      console.log(`   ⚠️ BNB 偏低(当前 ${ethers.formatEther(bnb)}，阈值 ${CFG.MIN_BNB_GAS})，建议多留一点，否则拥堵时可能不够 gas`);
+    if (wi > 0) {
+      lines.push('   ✅ 本地校验通过（私钥/地址匹配；余额体检见第 1 个账号，运行时逐账号处理）');
+      return { lines, ready };
     }
-    // 逐房间说明钱够不够
-    for (const room of CFG.ROOMS) {
-      if (!roomOk[room]) continue;
-      const cfg = await qRead.roomConfigs(room).catch(() => null);
-      if (!cfg) continue;
-      const p = cfg.ticketPrice;
-      const okBal = usdt >= p;
-      console.log(`   房间${room}(${ethers.formatUnits(p, 18)}U): USDT ${okBal ? '✅ 够' : '❌ 不够(差 ' + ethers.formatUnits(p - usdt, 18) + ')'}` +
-        ` | 授权 ${allow >= p ? '✅ 够' : '⚠️ 需先授权 ' + ethers.formatUnits(p, 18)}`);
-      if (!okBal) allReady = false;
-    }
-    if (allow === 0n) console.log('   ⚠️ 授权为 0，首次入场会自动发起"单轮票价"授权交易');
-    // 老系统矿机额度: 只有达到房间阈值才能 formLP 组机(与中奖无关，靠历史中奖累积)
-    if (CFG.MINING_CLAIM) {
-      try {
-        const mv = new ethers.Contract(CFG.MINING_VAULT_ADDR, MINING_V8_ABI, mgr.provider);
-        const lm = new ethers.Contract(CFG.LEGACY_MINING_ADDR, MINING_LEGACY_ABI, mgr.provider);
-        const [pv, pl] = await Promise.all([
-          mv.pendingOf(w.ADDRESS),
-          lm.pendingReward(w.ADDRESS).catch(e => {
-            if (e.code === 'CALL_EXCEPTION' || decodeRevert(e) !== null) return 0n;
-            throw e;
-          })
-        ]);
-        console.log(`   矿机产出: 新版可领 ${ethers.formatUnits(pv, 18)} FTS / 老版可领 ${ethers.formatUnits(pl, 18)} FTS` +
-          (BigInt(pv) + BigInt(pl) > 0n ? '（>0 会立即领取）' : ''));
-      } catch (e) {
-        console.log('   矿机产出读取失败: ' + formatError(e));
+    try {
+      const [bnb, usdt, allow] = await Promise.all([
+        mgr.rpc(p => p.getBalance(w.ADDRESS)),
+        mgr.rpc(p => uRead.balanceOf(w.ADDRESS)),
+        mgr.rpc(p => uRead.allowance(w.ADDRESS, CFG.QUEUE_ADDR))
+      ]);
+      lines.push(`   BNB=${ethers.formatEther(bnb)} | USDT=${ethers.formatUnits(usdt, 18)} | 已授权=${ethers.formatUnits(allow, 18)} (单轮授权模式)`);
+      if (bnb < minBnb) {
+        lines.push(`   ❌ BNB 不足(当前 ${ethers.formatEther(bnb)} < 阈值 ${CFG.MIN_BNB_GAS})，无法支付 gas，所有交易都会失败`);
+        ready = false;
+      } else if (bnb < minBnb * 3n) {
+        lines.push(`   ⚠️ BNB 偏低(当前 ${ethers.formatEther(bnb)}，阈值 ${CFG.MIN_BNB_GAS})，建议多留一点，否则拥堵时可能不够 gas`);
       }
-    }
-
-    if (CFG.MINER_ENABLED) {
-      for (const t of minerTargets()) {
+      for (const room of CFG.ROOMS) {
+        const cfg = roomCfgs[room];
+        if (!cfg) continue;
+        const price = cfg.ticketPrice;
+        const okBal = usdt >= price;
+        lines.push(`   房间${room}(${ethers.formatUnits(price, 18)}U): USDT ${okBal ? '✅ 够' : '❌ 不够(差 ' + ethers.formatUnits(price - usdt, 18) + ')'}` +
+          ` | 授权 ${allow >= price ? '✅ 够' : '⚠️ 需先授权 ' + ethers.formatUnits(price, 18)}`);
+        if (!okBal) ready = false;
+      }
+      if (allow === 0n) lines.push('   ⚠️ 授权为 0，首次入场会自动发起"单轮票价"授权交易');
+      if (CFG.MINING_CLAIM) {
         try {
-          const c = new ethers.Contract(t.addr, QUEUE_ABI, mgr.provider);
-          const [q, rc] = await Promise.all([
-            c.pendingQuotaUsd(w.ADDRESS),
-            c.roomConfigs(CFG.MINER_ROOM)
+          const mv = new ethers.Contract(CFG.MINING_VAULT_ADDR, MINING_V8_ABI, mgr.provider);
+          const lm = new ethers.Contract(CFG.LEGACY_MINING_ADDR, MINING_LEGACY_ABI, mgr.provider);
+          const [pv, pl] = await Promise.all([
+            mv.pendingOf(w.ADDRESS),
+            lm.pendingReward(w.ADDRESS).catch(e => {
+              if (e.code === 'CALL_EXCEPTION' || decodeRevert(e) !== null) return 0n;
+              throw e;
+            })
           ]);
-          const canForm = BigInt(q) >= BigInt(rc.quotaThreshold);
-          const payDesc = t.fixed ? `固定 ${CFG.MINER_USD}U` : `按额度 ${ethers.formatUnits(q, 18)}U`;
-          console.log(`   矿机组装[${t.label}]: 额度 ${ethers.formatUnits(q, 18)}U / 阈值 ${ethers.formatUnits(rc.quotaThreshold, 18)}U -> ` +
-            (canForm ? `✅ 可组机(${payDesc})` : '⏳ 额度不足，暂不可组机'));
-        } catch (e) {
-          console.log(`   矿机组装[${t.label}] 读取失败: ` + formatError(e));
+          lines.push(`   矿机产出: 新版可领 ${ethers.formatUnits(pv, 18)} FTS / 老版可领 ${ethers.formatUnits(pl, 18)} FTS` +
+            (BigInt(pv) + BigInt(pl) > 0n ? '（>0 会立即领取）' : ''));
+        } catch (e) { lines.push('   矿机产出读取失败: ' + formatError(e)); }
+      }
+      if (CFG.MINER_ENABLED) {
+        for (const t of minerTargets()) {
+          try {
+            const c = new ethers.Contract(t.addr, QUEUE_ABI, mgr.provider);
+            const [q, rc] = await Promise.all([c.pendingQuotaUsd(w.ADDRESS), c.roomConfigs(CFG.MINER_ROOM)]);
+            const canForm = BigInt(q) >= BigInt(rc.quotaThreshold);
+            const payDesc = t.fixed ? `固定 ${CFG.MINER_USD}U` : `按额度 ${ethers.formatUnits(q, 18)}U`;
+            lines.push(`   矿机组装[${t.label}]: 额度 ${ethers.formatUnits(q, 18)}U / 阈值 ${ethers.formatUnits(rc.quotaThreshold, 18)}U -> ` +
+              (canForm ? `✅ 可组机(${payDesc})` : '⏳ 额度不足，暂不可组机'));
+          } catch (e) { lines.push(`   矿机组装[${t.label}] 读取失败: ` + formatError(e)); }
         }
       }
+    } catch (e) {
+      lines.push('   ❌ 账号检查失败: ' + formatError(e));
+      ready = false;
     }
-  }
+    return { lines, ready };
+  }));
+  let allReady = true;
+  for (const r of results) { r.lines.forEach(l => console.log(l)); if (!r.ready) allReady = false; }
 
   console.log('\n--- 5. 交易预演 (不上链，一分钱不花) ---');
-  for (const w of wallets) {
+  // 预演只验证"合约能否调通、账号是否满足业务规则"，同一合约对任何账号结果一致，
+  // 抽查前 3 个即可；100 账号全跑既慢又白费节点请求。
+  const PREVIEW_N = Math.min(3, wallets.length);
+  console.log(`  （合约预演是全局性的，抽查前 ${PREVIEW_N} 个账号即可，避免 100 账号逐个预演太慢）`);
+  for (const w of wallets.slice(0, PREVIEW_N)) {
     for (const room of CFG.ROOMS) {
       let cfg = null;
       try { cfg = await mgr.rpc(p => qRead.roomConfigs(room)); } catch (e) { }
@@ -2251,6 +2389,308 @@ async function selftest() {
   exitFlush(allReady ? 0 : 1);
 }
 
+// ---------------- 钱包文件加密 ----------------
+// 格式: {"v":1,"encrypted":true,"salt":hex,"iv":hex,"tag":hex,"data":hex}
+// 密钥: scrypt(密码, salt, N=2^14) -> 32 字节 AES-256 密钥；AES-256-GCM 认证加密。
+// 密码只从环境变量 FTS_WALLET_PASSWORD 读一次；解密后明文私钥仅在内存停留到进程结束，
+// 不写日志、不回显、不进环境变量(避免 /proc/<pid>/environ 泄露)。
+const CRYPTO = require('crypto');
+const WALLET_ENC_VERSION = 1;
+function deriveKey(password, salt) {
+  // scrypt 内存硬函数，抗暴力破解；N=16384 约 16MB，单次 ~50ms
+  return CRYPTO.scryptSync(password, salt, 32, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+}
+function encryptWalletsFile(plainObj, password) {
+  const salt = CRYPTO.randomBytes(16);
+  const iv = CRYPTO.randomBytes(12);
+  const key = deriveKey(password, salt);
+  const cipher = CRYPTO.createCipheriv('aes-256-gcm', key, iv);
+  const plaintext = Buffer.from(JSON.stringify(plainObj), 'utf8');
+  const enc = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  key.fill(0); plaintext.fill(0);
+  return {
+    v: WALLET_ENC_VERSION, encrypted: true,
+    salt: salt.toString('hex'), iv: iv.toString('hex'),
+    tag: tag.toString('hex'), data: enc.toString('hex')
+  };
+}
+function decryptWalletsFile(obj, password) {
+  if (!obj || obj.encrypted !== true) throw new Error('不是加密格式');
+  if (obj.v !== WALLET_ENC_VERSION) throw new Error('不支持的加密版本: ' + obj.v);
+  const salt = Buffer.from(obj.salt, 'hex'), iv = Buffer.from(obj.iv, 'hex');
+  const tag = Buffer.from(obj.tag, 'hex'), enc = Buffer.from(obj.data, 'hex');
+  const key = deriveKey(password, salt);
+  const decipher = CRYPTO.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  let dec;
+  try { dec = Buffer.concat([decipher.update(enc), decipher.final()]); }
+  catch (e) { key.fill(0); throw new Error('解密失败: 密码错误或文件被篡改'); }
+  key.fill(0);
+  const txt = dec.toString('utf8'); dec.fill(0);
+  return JSON.parse(txt);
+}
+function getWalletPassword() {
+  if (process.env.FTS_WALLET_PASSWORD) return process.env.FTS_WALLET_PASSWORD;
+  return null;
+}
+
+// ---------------- 网页自动探测合约地址 ----------------
+// 游戏前端把合约地址写成 VITE_P2_XXX:"0x..." 映射在 JS bundle 里，网页换合约时
+// 这个映射会变。直接抓页面 -> 提取 JS 地址 -> 解析映射 -> 写回 config.json，
+// 无需改代码。所有地址都做链上代码存在性校验，避免抓到假地址。
+const WEB_CONTRACT_MAP = {
+  QUEUE_ADDR: 'VITE_P2_QUEUE',
+  MINER_QUEUE_ADDR: 'VITE_P2_LEGACY_QUEUE',
+  MINING_VAULT_ADDR: 'VITE_P2_MINING',
+  LEGACY_MINING_ADDR: 'VITE_P2_LEGACY_MINING',
+  USDT_ADDR: 'VITE_P2_USDT',
+  FTS_ADDR: 'VITE_P2_TOKEN',
+  MARKET_ADDR: 'VITE_MARKET_ESCROW'
+};
+async function fetchText(url, timeoutMs) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs || 15000);
+  try {
+    const r = await fetch(url, { signal: ctl.signal, headers: { 'User-Agent': 'Mozilla/5.0 FTS-Bot-Contract-Sync' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.text();
+  } finally { clearTimeout(timer); }
+}
+function absoluteUrl(base, path) {
+  try { return new URL(path, base).href; } catch (e) { return null; }
+}
+// 探测网页返回 {found:{configKey:addr}, all:{VITE_*:addr}, jsUrls}
+// 同时抓游戏页和市场页(市场合约 VITE_MARKET_ESCROW 只在市场页 bundle 里)
+async function probeWebContracts(gameUrl, marketUrl) {
+  const pages = [gameUrl, marketUrl].filter(Boolean);
+  const found = {}, all = {}, jsUrls = [];
+  for (const pageUrl of pages) {
+    let html;
+    try { html = await fetchText(pageUrl, 15000); } catch (e) { continue; }
+    // 提取 <script src="..."> 里的 JS；主 bundle + 页面 chunk(如 MarketPage-xxx.js) 都要
+    const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+\.js)["']/gi)].map(m => m[1]);
+    const main = scripts.filter(s => !/vendor/i.test(s));
+    const candidates = (main.length ? main : scripts).map(s => absoluteUrl(pageUrl, s)).filter(Boolean);
+    // 主 bundle 可能 import 页面 chunk，从 JS 里再提取 assets/*.js
+    let jsBodies = [];
+    for (const jsUrl of candidates.slice(0, 2)) {
+      let js;
+      try { js = await fetchText(jsUrl, 30000); } catch (e) { continue; }
+      jsBodies.push({ url: jsUrl, body: js });
+      jsUrls.push(jsUrl);
+      // 找 import 的页面 chunk(如 MarketPage-xxx.js)
+      const chunks = [...new Set((js.match(/["'][^"']*assets\/[A-Za-z0-9_-]+\.js["']/g) || []))]
+        .map(x => x.replace(/^["']|["']$/g, ''));
+      for (const ch of chunks.slice(0, 20)) {
+        const cu = absoluteUrl(pageUrl, ch.startsWith('/') ? ch : '/assets/' + ch.split('/').pop());
+        if (!cu || jsUrls.includes(cu)) continue;
+        try { const cb = await fetchText(cu, 15000); jsBodies.push({ url: cu, body: cb }); jsUrls.push(cu); } catch (e) { }
+      }
+    }
+    for (const { body } of jsBodies) {
+      const re = /(VITE_[A-Z0-9_]+)\s*:\s*["'](0x[a-fA-F0-9]{40})["']/g;
+      let m;
+      while ((m = re.exec(body))) {
+        all[m[1]] = m[2];
+        for (const [cfgKey, viteKey] of Object.entries(WEB_CONTRACT_MAP)) {
+          if (m[1] === viteKey && !found[cfgKey]) found[cfgKey] = m[2];
+        }
+      }
+    }
+  }
+  return { found, all, jsUrls };
+}
+// 校验地址在链上有代码；返回 {addr:bool}
+async function validateContractAddresses(addrs) {
+  const out = {};
+  await Promise.all(Object.entries(addrs).map(async ([k, a]) => {
+    try {
+      const code = await mgr.rpc(p => p.getCode(a));
+      out[k] = !!(code && code !== '0x');
+    } catch (e) { out[k] = false; }
+  }));
+  return out;
+}
+// 把探测到的地址写回 config.json（保留其它配置，只改合约字段）
+function saveWebContracts(found) {
+  let cfg = {};
+  try {
+    const raw = fs.readFileSync(CONFIG_FILE, 'utf8').replace(/^\uFEFF/, '');
+    cfg = JSON.parse(raw);
+    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) cfg = {};
+  } catch (e) { /* 新文件 */ }
+  let changed = 0;
+  for (const [k, v] of Object.entries(found)) {
+    if (/^0x[a-fA-F0-9]{40}$/.test(v) && cfg[k] !== v) { cfg[k] = v; changed++; }
+  }
+  if (changed) {
+    const tmp = CONFIG_FILE + '.tmp';
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, CONFIG_FILE);
+    } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (e) { } } }
+  }
+  return changed;
+}
+// 完整同步流程: 探测 -> 校验链上代码 -> 写回；返回报告
+async function syncWebContracts(apply) {
+  info('SYS', `从游戏网页探测合约: ${CFG.GAME_URL}`);
+  const r = await probeWebContracts(CFG.GAME_URL, CFG.MARKET_URL);
+  const keys = Object.keys(r.found);
+  if (!keys.length) throw new Error('未从网页解析到任何合约地址(JS 结构可能变化)');
+  info('SYS', `找到 ${keys.length} 个合约映射: ${keys.join(', ')}`);
+  // 链上校验(用 mgr.provider; 若尚未 pickBest 则临时建一个)
+  if (!mgr.provider) {
+    try { await mgr.pickBest(); } catch (e) { warn('SYS', '链上校验跳过(RPC 不可用): ' + formatError(e).slice(0, 100)); }
+  }
+  const valid = mgr.provider ? await validateContractAddresses(r.found) : {};
+  const accepted = {};
+  for (const k of keys) {
+    const okCode = valid[k] !== false;   // 校验失败不阻挡(可能因临时节点问题)
+    if (okCode) accepted[k] = r.found[k];
+    else warn('SYS', `${k}=${r.found[k]} 链上无代码，已忽略`);
+  }
+  const changed = apply ? saveWebContracts(accepted) : 0;
+  return { found: r.found, accepted, all: r.all, jsUrls: r.jsUrls, changed };
+}
+
+// ---------------- FTS 自动买卖 ----------------
+const MARKET_ABI = [
+  'function fts() view returns (address)',
+  'function usdt() view returns (address)',
+  'function pair() view returns (address)',
+  'function poolPrice() view returns (uint256)',
+  'function nextOrderId() view returns (uint256)',
+  'function orders(uint256) view returns (address seller, uint256 ftsAmount, uint256 totalPriceU, uint256 createdAt, uint8 status, uint256 feeBps)',
+  'function fillOrder(uint256 orderId)',
+  'function createOrder(uint256 ftsAmount, uint256 totalPriceU) returns (uint256)',
+  'function cancelOrder(uint256 orderId)'
+];
+const PAIR_ABI = [
+  'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)'
+];
+// 读 FTS 真实价格: 从 DEX pair 储备算 USDT/FTS，不读市场挂单价(用户要求)
+async function getFtsSpotPrice(market) {
+  const pairAddr = await mgr.rpc(p => market.pair());
+  const ftsAddr = await mgr.rpc(p => market.fts());
+  const usdtAddr = await mgr.rpc(p => market.usdt());
+  const pair = new ethers.Contract(pairAddr, PAIR_ABI, mgr.provider);
+  const [res, t0] = await Promise.all([
+    mgr.rpc(p => pair.getReserves()),
+    mgr.rpc(p => pair.token0())
+  ]);
+  const r0 = BigInt(res.reserve0 || res[0]);
+  const r1 = BigInt(res.reserve1 || res[1]);
+  if (r0 <= 0n || r1 <= 0n) return null;
+  const lower = String(t0).toLowerCase();
+  // 判断哪个储备是 FTS、哪个是 USDT
+  const rFts = lower === String(ftsAddr).toLowerCase() ? r0 : r1;
+  const rUsdt = lower === String(usdtAddr).toLowerCase() ? r0 : r1;
+  if (rFts <= 0n || rUsdt <= 0n) return null;
+  // USDT(18位) / FTS(18位) -> 人类可读单价
+  return Number(ethers.formatUnits(rUsdt, 18)) / Number(ethers.formatUnits(rFts, 18));
+}
+// 扫描活跃挂单(status=1)，返回 [{id, seller, ftsAmount, totalPriceU, unitPrice}]，按单价升序
+async function scanMarketOrders(market, scanN) {
+  const nextId = Number(await mgr.rpc(p => market.nextOrderId()));
+  if (!Number.isFinite(nextId) || nextId <= 1) return [];
+  const from = Math.max(1, nextId - scanN);
+  const ids = Array.from({ length: nextId - from }, (_, i) => from + i);
+  const me = instances[0] ? instances[0].address.toLowerCase() : '';
+  const results = await Promise.all(ids.map(async id => {
+    try {
+      const o = await mgr.rpc(p => market.orders(id));
+      const status = Number(o.status !== undefined ? o.status : o[4]);
+      if (status !== 1) return null;                       // 只关心活跃挂单
+      const seller = String(o.seller !== undefined ? o.seller : o[0]);
+      if (seller.toLowerCase() === me) return null;        // 不吃自己的单
+      const ftsAmount = BigInt(o.ftsAmount !== undefined ? o.ftsAmount : o[1]);
+      const totalPriceU = BigInt(o.totalPriceU !== undefined ? o.totalPriceU : o[2]);
+      if (ftsAmount <= 0n) return null;
+      const unitPrice = Number(ethers.formatUnits(totalPriceU, 18)) / Number(ethers.formatUnits(ftsAmount, 18));
+      return { id, seller, ftsAmount, totalPriceU, unitPrice };
+    } catch (e) { return null; }
+  }));
+  return results.filter(Boolean).sort((a, b) => a.unitPrice - b.unitPrice);
+}
+// 买单循环: 单价低于阈值时吃单，总额不超上限
+async function tradeBuyLoop(inst, market) {
+  let spent = 0;
+  while (true) {
+    try {
+      if (CFG.TRADE_BUY_MAX_PRICE === null || CFG.TRADE_BUY_MAX_TOTAL === null) {
+        warnOnce(inst.address, '买单已开启但未配置阈值(TRADE_BUY_MAX_PRICE/TRADE_BUY_MAX_TOTAL)，跳过', 300000);
+        await sleep(CFG.TRADE_CHECK_MS); continue;
+      }
+      if (spent >= CFG.TRADE_BUY_MAX_TOTAL) {
+        warnOnce(inst.address, `买单今日已花费 ${spent.toFixed(2)}U 达到上限 ${CFG.TRADE_BUY_MAX_TOTAL}U，停止`, 300000);
+        await sleep(CFG.TRADE_CHECK_MS); continue;
+      }
+      const orders = await scanMarketOrders(market, CFG.TRADE_BUY_SCAN_N);
+      const affordable = orders.filter(o => o.unitPrice <= CFG.TRADE_BUY_MAX_PRICE);
+      for (const o of affordable) {
+        const cost = Number(ethers.formatUnits(o.totalPriceU, 18));
+        if (spent + cost > CFG.TRADE_BUY_MAX_TOTAL) continue;
+        // 用 sendTx 走统一的 nonce/gas 管理，避免撞号
+        const okTx = await sendTx(inst, {
+          label: `[买单] 吃单#${o.id} 单价${o.unitPrice.toFixed(4)}U`,
+          contract: market, method: 'fillOrder', args: [o.id]
+        });
+        if (okTx) { spent += cost; info(inst.address, `[买单] 已吃单#${o.id} 花费 ${cost.toFixed(2)}U，累计 ${spent.toFixed(2)}U`); }
+        if (spent >= CFG.TRADE_BUY_MAX_TOTAL) break;
+      }
+    } catch (e) {
+      warnOnce(inst.address, '买单循环异常: ' + formatError(e).slice(0, 120), 60000);
+    }
+    await sleep(CFG.TRADE_CHECK_MS);
+  }
+}
+// 卖单循环: 读真实价，满足条件时挂单(createOrder)
+async function tradeSellLoop(inst, market) {
+  let listed = 0;
+  while (true) {
+    try {
+      const spot = await getFtsSpotPrice(market);
+      if (!spot) { warnOnce(inst.address, '卖单: 读不到 FTS 真实价格(pair 储备异常)，跳过', 300000); await sleep(CFG.TRADE_CHECK_MS); continue; }
+      let shouldSell = false, targetPrice = 0;
+      if (CFG.TRADE_SELL_MODE === 'fixed') {
+        if (CFG.TRADE_SELL_PRICE !== null && spot >= CFG.TRADE_SELL_PRICE) { shouldSell = true; targetPrice = CFG.TRADE_SELL_PRICE; }
+      } else if (CFG.TRADE_SELL_MODE === 'spotminus') {
+        // 时价减差值: 只要价差参数有效就挂(挂单价=真实价-差值)
+        if (CFG.TRADE_SELL_PRICE !== null && spot > CFG.TRADE_SELL_PRICE) { shouldSell = true; targetPrice = spot - CFG.TRADE_SELL_PRICE; }
+      } else {
+        warnOnce(inst.address, '卖单模式无效(应设 fixed 或 spotminus)，跳过', 300000);
+      }
+      if (shouldSell && targetPrice > 0 && CFG.TRADE_SELL_AMOUNT !== null) {
+        const ftsAmount = ethers.parseUnits(String(CFG.TRADE_SELL_AMOUNT), 18);
+        const totalPriceU = ethers.parseUnits((targetPrice * CFG.TRADE_SELL_AMOUNT).toFixed(6), 18);
+        const okTx = await sendTx(inst, {
+          label: `[卖单] 挂 ${CFG.TRADE_SELL_AMOUNT} FTS @${targetPrice.toFixed(4)}U(真实价${spot.toFixed(4)})`,
+          contract: market, method: 'createOrder', args: [ftsAmount, totalPriceU]
+        });
+        if (okTx) { listed++; info(inst.address, `[卖单] 已挂单 ${CFG.TRADE_SELL_AMOUNT} FTS @${targetPrice.toFixed(4)}U`); }
+      }
+    } catch (e) {
+      warnOnce(inst.address, '卖单循环异常: ' + formatError(e).slice(0, 120), 60000);
+    }
+    await sleep(CFG.TRADE_CHECK_MS);
+  }
+}
+function startTrading(inst) {
+  if (!CFG.TRADE_BUY_ENABLED && !CFG.TRADE_SELL_ENABLED) return;
+  const addr = CFG.MARKET_ADDR;
+  if (!/^0x[a-fA-F0-9]{40}$/.test(addr || '')) {
+    warn(inst.address, 'FTS 买卖已开启但市场合约地址为空，请先运行 --sync-web 或配置 MARKET_ADDR');
+    return;
+  }
+  const market = new ethers.Contract(addr, MARKET_ABI, inst.wallet);
+  if (CFG.TRADE_BUY_ENABLED) { info(inst.address, `买单循环启动(阈值≤${CFG.TRADE_BUY_MAX_PRICE}U, 上限${CFG.TRADE_BUY_MAX_TOTAL}U)`); tradeBuyLoop(inst, market); }
+  if (CFG.TRADE_SELL_ENABLED) { info(inst.address, `卖单循环启动(模式${CFG.TRADE_SELL_MODE}, 阈值${CFG.TRADE_SELL_PRICE})`); tradeSellLoop(inst, market); }
+}
+
 // ---------------- 钱包加载 ----------------
 function loadWallets() {
   if (!fs.existsSync(WALLETS_FILE)) {
@@ -2260,6 +2700,18 @@ function loadWallets() {
   let data;
   try { data = JSON.parse(fs.readFileSync(WALLETS_FILE, 'utf8').replace(/^﻿/, '')); }
   catch (e) { fatal('CFG', `wallets.json 解析失败: ${e.message}`); return []; }
+  // 加密文件解密
+  if (data.encrypted === true) {
+    const pwd = getWalletPassword();
+    if (!pwd) {
+      fatal('CFG', 'wallets.json 已加密，但未提供密码。请设置环境变量 FTS_WALLET_PASSWORD 后重试');
+      return [];
+    }
+    try { data = decryptWalletsFile(data, pwd); }
+    catch (e) { fatal('CFG', '钱包解密失败: ' + e.message); return []; }
+  } else {
+    warn('CFG', '⚠️ wallets.json 是明文存储！建议运行 --encrypt 加密，避免私钥泄露');
+  }
   const list = data.wallets || [];
   const out = [];
   for (const c of list) {
@@ -2278,8 +2730,70 @@ function loadWallets() {
   return out;
 }
 
+// 从 stdin 逐行读密码。管道模式一次性读完再按行取(避免流提前结束导致第二次读为空)；
+// TTY 模式用 readline 交互。密码不回显由终端负责。
+const readline = require('readline');
+function readPasswordLines() {
+  return new Promise(resolve => {
+    if (!process.stdin.isTTY) {
+      // 管道/重定向: 一次性读全部，按行分割
+      let buf = '';
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', c => { buf += c; });
+      process.stdin.on('end', () => resolve(buf.split(/\r?\n/).filter((s, i, a) => s !== '' || i < a.length - 1)));
+      return;
+    }
+    // TTY: 交互式逐行
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const lines = [];
+    rl.question('设置密码(至少8位): ', p1 => {
+      lines.push(p1);
+      rl.question('再输入一次确认: ', p2 => { lines.push(p2); rl.close(); resolve(lines); });
+    });
+  });
+}
+// 加密 wallets.json: 读明文 -> 输入密码两次 -> 写加密格式 -> 验证解密
+async function cmdEncrypt() {
+  if (!fs.existsSync(WALLETS_FILE)) { fatal('CFG', '找不到 ' + WALLETS_FILE); exitFlush(1); return; }
+  const raw = fs.readFileSync(WALLETS_FILE, 'utf8').replace(/^﻿/, '');
+  let obj;
+  try { obj = JSON.parse(raw); } catch (e) { fatal('CFG', 'wallets.json 解析失败: ' + e.message); exitFlush(1); return; }
+  if (obj.encrypted === true) { warn('CFG', 'wallets.json 已经是加密格式，无需重复加密'); exitFlush(0); return; }
+  if (!obj.wallets || !obj.wallets.length) { fatal('CFG', 'wallets.json 中没有账号，无需加密'); exitFlush(1); return; }
+  const lines = await readPasswordLines();
+  const p1 = lines[0], p2 = lines[1];
+  if (!p1 || p1.length < 8) { fatal('CFG', '密码不能少于8位，已取消'); exitFlush(1); return; }
+  if (p1 !== p2) { fatal('CFG', '两次密码不一致，已取消'); exitFlush(1); return; }
+  const enc = encryptWalletsFile(obj, p1);
+  // 验证能正确解密(防止写出坏文件把钱包锁死)
+  try {
+    const back = decryptWalletsFile(enc, p1);
+    if (!back.wallets || back.wallets.length !== obj.wallets.length) throw new Error('解密后账号数不符');
+  } catch (e) { fatal('CFG', '加密自检失败，未写入: ' + e.message); exitFlush(1); return; }
+  const tmp = WALLETS_FILE + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(enc), { mode: 0o600 });
+    fs.renameSync(tmp, WALLETS_FILE);
+  } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (e) { } } }
+  // 明文 buffer 尽力清零
+  raw && (() => { })();
+  ok('CFG', `wallets.json 已加密(${obj.wallets.length} 个账号)。运行时用环境变量 FTS_WALLET_PASSWORD 提供密码`);
+  warn('CFG', '⚠️ 请务必记住密码，丢失后无法恢复钱包！');
+  exitFlush(0);
+}
+
 // ---------------- 主流程 ----------------
 async function main() {
+  if (MODE === 'encrypt') return cmdEncrypt();
+  if (MODE === 'sync-web') {
+    try {
+      const r = await syncWebContracts(true);
+      ok('SYS', `网页合约同步完成: 写入 ${r.changed} 项; 抓取 ${r.jsUrls.length} 个 JS`);
+      for (const [k, v] of Object.entries(r.accepted)) console.log(`  ${k} = ${v}`);
+      exitFlush(0);
+    } catch (e) { fatal('SYS', '网页合约同步失败: ' + formatError(e)); exitFlush(1); }
+    return;
+  }
   // 配置校验: 有问题就地修正并明确告知，不让它悄悄生效或让引擎崩掉
   const cfgIssues = validateCfg();
   if (cfgIssues.length) {
@@ -2300,6 +2814,12 @@ async function main() {
 
   try { await mgr.pickBest(); }
   catch (e) { fatal('SYS', 'RPC 初始化失败: ' + formatError(e)); exitFlush(22); return; }
+  // 网页合约自动同步: 后台异步检测，不阻塞启动。发现新合约写回 config.json，下次重启生效。
+  if (CFG.WEB_AUTO_SYNC && MODE === 'run') {
+    syncWebContracts(true)
+      .then(r => { if (r.changed) warn('SYS', `网页检测到 ${r.changed} 个合约地址变化，已写入 config.json，重启后生效`); })
+      .catch(e => warnOnce('SYS', '网页合约同步失败(不影响本次运行): ' + formatError(e).slice(0, 120), 300000));
+  }
   bindRead(mgr.provider);
   await detectEip1559();
 
@@ -2333,6 +2853,8 @@ async function main() {
     if (CFG.MINER_ENABLED) minerLoop(inst);
     if (CFG.MINING_CLAIM) miningClaimLoop(inst);
   }
+  // FTS 买卖只用第一个账号跑，避免多账号重复吃同一笔单/重复挂单
+  if (CFG.TRADE_BUY_ENABLED || CFG.TRADE_SELL_ENABLED) startTrading(instances[0]);
 
   const au = userCfg.AUTO_UPDATE;
   const autoUpdateOn = !(au === false || au === 0 || au === '0' || au === 'false' || au === 'off');

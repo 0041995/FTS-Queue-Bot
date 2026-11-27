@@ -150,6 +150,8 @@ Release 里还附带 `update.sh` / `update.ps1`，双击/执行即可完成同�
 | **中奖处理** | 自动领取 | 中奖后 48 小时内自动领额度；也可以选"不领取"（放弃该奖励） |
 | **组矿机** | 关 | 开启后选模式：只用老额度 / 只用新版额度 / 两者都组 |
 | **老系统固定支付** | 100 USDT | 仅老系统模式用；额度再高也只扣这个数 |
+| **FTS 自动买入** | 关 | 监控市场挂单，单价≤你设的值时自动吃单，总额不超上限（阈值必须自己填） |
+| **FTS 自动卖出** | 关 | 读 DEX 池真实价（不读挂单价），达条件自动挂单；支持固定价或"时价减差值" |
 
 ---
 
@@ -188,12 +190,20 @@ Release 里还附带 `update.sh` / `update.ps1`，双击/执行即可完成同�
 ## 安全与隐私
 
 - **私钥不出本机**：只存在运行目录的 `wallets.json`，不上传、不回传。Windows 版自动收紧文件权限。
+- **支持加密存储**：跑一次 `--encrypt` 设置密码，`wallets.json` 会变成 AES-256-GCM 密文（scrypt 派生密钥，随机 salt，篡改会被认证拒绝）。运行时用环境变量 `FTS_WALLET_PASSWORD` 提供密码，明文私钥只在内存短暂停留，不写日志、不回显。**密码务必记住，丢失无法恢复。**
 - **不做无限授权**：按当前票价/组机金额精确授权，不签空白支票。
 - **只读模式可验证**：`--probe` / `--selftest` 不需要私钥、不花一分钱。
 - **完全开源**：代码在 `src/`，产物由 `build/build.py` 生成，可自行构建。
 - **无后台服务**：脚本只跟 BSC 节点和游戏合约通信。
 
 ⚠️ `wallets.json` **就是你的私钥**。别同步网盘、别发聊天工具、别提交 Git，务必用专门的小号钱包。
+
+> 加密用法：
+> ```
+> bash autofts.sh --encrypt          # 设置密码（至少8位）
+> export FTS_WALLET_PASSWORD=你的密码  # 运行前提供
+> bash autofts.sh --run
+> ```
 
 ---
 
@@ -242,10 +252,18 @@ MIT，见 [LICENSE](LICENSE)。
 源码在 `src/`，`build/build.py` 把引擎注入两个模板，生成 Releases 里的单文件脚本：
 
 ```bash
-python3 build/build.py      # 产物在 dist/
-node test/sendtx-nonce.js   # nonce 重发回归测试
-node test/approve-guard.js  # 配置边界测试（需 ethers）
-node test/claims-flex.js    # 领取健壮性 / 灵活资金决策测试（需 ethers）
+python3 build/build.py              # 产物在 dist/
+node test/sendtx-nonce.js           # nonce 重发回归测试
+node test/approve-guard.js          # 授权额度边界（需 ethers）
+node test/claims-flex.js            # 领取健壮性 / 灵活资金决策 32 项（需 ethers）
+node test/semaphore-concurrency.js  # 并发闸门不顶穿
+node test/rate-limits.js            # 并发/吞吐参数保护
+node test/node-pool.js              # 多节点分层/溢出
+node test/wallet-crypto.js          # 钱包加密（AES-GCM）
+node test/web-sync.js               # 网页合约探测
+node test/trade.js                  # FTS 自动买卖逻辑
 ```
 
-关键配置：`QUEUE_ADDR`（新队列）、`MINER_MODE`（old/new/both）、`MINER_USD`、`CLAIM_WIN`、`FLEX_DECISION`（灵活资金决策，默认 false）。更细的字段和原理见源码注释。
+关键配置：`QUEUE_ADDR`（新队列）、`MINER_MODE`（old/new/both）、`MINER_USD`、`CLAIM_WIN`、`FLEX_DECISION`（灵活资金决策，默认 false）、`GAME_URL`/`WEB_AUTO_SYNC`（网页自动同步合约）、`TRADE_BUY_ENABLED`/`TRADE_SELL_ENABLED`（FTS 买卖，默认 false）。更细的字段和原理见源码注释。
+
+**换合约不用改代码**：游戏网页会把合约地址写在 `VITE_P2_*` 映射里，脚本启动时（或手动 `--sync-web`）自动抓取并校验链上代码后写回 `config.json`。

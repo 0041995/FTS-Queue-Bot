@@ -37,6 +37,8 @@ usage() {
   --run        正式运行(默认)
   --init       打开配置向导(房间/抢位区间/延迟/手续费/账号)，配完即退出
   --settings   同 --init，随时回来改设置
+  --encrypt    加密 wallets.json(设置密码，运行时用 FTS_WALLET_PASSWORD 提供)
+  --sync-web   从游戏网页自动读取最新合约地址写入配置(换合约不用改代码)
   --update     一键更新到最新版本(原地替换脚本，支持私有仓库)
   --stop       停止后台运行的引擎
   --help       查看本帮助
@@ -185,6 +187,8 @@ while [ $# -gt 0 ]; do
     --selftest) MODE="selftest" ;;
     --dry-run)  MODE="dry-run" ;;
     --run)      MODE="run" ;;
+    --encrypt)  MODE="encrypt" ;;
+    --sync-web) MODE="sync-web" ;;
     --init)     DO_INIT=1 ;;
     --settings) DO_WIZARD=1 ;;
     --update)   MODE="update" ;;
@@ -296,6 +300,16 @@ UPDATEJS_EOF
 node --check update.js || die "update.js 生成异常(语法错误)"
 ok_msg "核心引擎 core.js + 只读探针 probe.js + 更新器 update.js 已写入"
 
+# --encrypt / --sync-web 都在"要求输入私钥"的向导之前退出
+if [ "$MODE" = "encrypt" ]; then
+  node core.js encrypt
+  exit $?
+fi
+if [ "$MODE" = "sync-web" ]; then
+  node core.js sync-web
+  exit $?
+fi
+
 # --probe 是纯只读探测，必须在"要求输入私钥"之前退出
 if [ "$MODE" = "probe" ]; then
   echo ""
@@ -326,6 +340,9 @@ WIZ_GAS_MODE="fixed"; WIZ_GAS_FIXED="0.05"; WIZ_GAS_MAX="10"; WIZ_GAS_MULT="1.25
 WIZ_CLAIM="20"; WIZ_BNB="0.005"
 WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_MINER_MODE="old"; WIZ_CLAIM_WIN="1"
 WIZ_UPDATE_TOKEN=""
+# FTS 自动买卖(默认关、阈值留空不设默认值)
+WIZ_BUY_ON="0"; WIZ_BUY_MAX_PRICE=""; WIZ_BUY_MAX_TOTAL=""
+WIZ_SELL_ON="0"; WIZ_SELL_MODE="fixed"; WIZ_SELL_PRICE=""; WIZ_SELL_AMOUNT=""
 
 # ---- 读现有 config.json 作为默认值 ----
 wiz_load() {
@@ -356,6 +373,13 @@ wiz_load() {
       MINER_MODE)       case "$v" in old|new|both) WIZ_MINER_MODE="$v" ;; esac ;;
       FLEX)             case "$v" in 1) WIZ_FLEX="1" ;; *) WIZ_FLEX="0" ;; esac ;;
       UPDATE_TOKEN)     WIZ_UPDATE_TOKEN="$v" ;;
+      TRADE_BUY)        case "$v" in 1) WIZ_BUY_ON="1" ;; *) WIZ_BUY_ON="0" ;; esac ;;
+      TRADE_BUY_MAX_PRICE) WIZ_BUY_MAX_PRICE="$v" ;;
+      TRADE_BUY_MAX_TOTAL) WIZ_BUY_MAX_TOTAL="$v" ;;
+      TRADE_SELL)       case "$v" in 1) WIZ_SELL_ON="1" ;; *) WIZ_SELL_ON="0" ;; esac ;;
+      TRADE_SELL_MODE)  case "$v" in fixed|spotminus) WIZ_SELL_MODE="$v" ;; esac ;;
+      TRADE_SELL_PRICE) WIZ_SELL_PRICE="$v" ;;
+      TRADE_SELL_AMOUNT) WIZ_SELL_AMOUNT="$v" ;;
     esac
   done < <(node -e '
     const fs=require("fs");
@@ -376,6 +400,13 @@ wiz_load() {
     console.log("CLAIM_WIN="+(c.CLAIM_WIN===false||c.CLAIM_WIN===0||c.CLAIM_WIN==="0"||c.CLAIM_WIN==="false"?"0":"1"));
     put("MINER_MODE",c.MINER_MODE);
     console.log("FLEX="+(c.FLEX_DECISION===true||c.FLEX_DECISION==="true"||c.FLEX_DECISION===1?"1":"0"));
+    console.log("TRADE_BUY="+(c.TRADE_BUY_ENABLED===true||c.TRADE_BUY_ENABLED==="true"||c.TRADE_BUY_ENABLED===1?"1":"0"));
+    put("TRADE_BUY_MAX_PRICE",c.TRADE_BUY_MAX_PRICE);
+    put("TRADE_BUY_MAX_TOTAL",c.TRADE_BUY_MAX_TOTAL);
+    console.log("TRADE_SELL="+(c.TRADE_SELL_ENABLED===true||c.TRADE_SELL_ENABLED==="true"||c.TRADE_SELL_ENABLED===1?"1":"0"));
+    put("TRADE_SELL_MODE",c.TRADE_SELL_MODE);
+    put("TRADE_SELL_PRICE",c.TRADE_SELL_PRICE);
+    put("TRADE_SELL_AMOUNT",c.TRADE_SELL_AMOUNT);
   ' 2>/dev/null)
   # 兼容旧配置里 CLAIM_INTERVAL_MS 直接是毫秒
   [ -n "$WIZ_CLAIM" ] || WIZ_CLAIM=20
@@ -453,6 +484,8 @@ wiz_header() {
   echo "    组矿机     : $(wiz_miner_text)"
   echo "    中奖处理   : $(wiz_claimwin_text)"
   echo "    灵活资金   : $(wiz_flex_text)"
+  echo "    FTS 买入   : $(wiz_buy_text)"
+  echo "    FTS 卖出   : $(wiz_sell_text)"
   echo "    自动更新   : $(wiz_update_text)"
   echo "  ────────────────────────────────────────────────────"
 }
@@ -631,6 +664,75 @@ wiz_edit_flex() {
   if [ "$ch" = "1" ]; then WIZ_FLEX="1"; else WIZ_FLEX="0"; fi
 }
 
+wiz_buy_text() {
+  if [ "$WIZ_BUY_ON" = "1" ]; then
+    echo "开启 (单价≤${WIZ_BUY_MAX_PRICE:-未设}U, 总额≤${WIZ_BUY_MAX_TOTAL:-未设}U)"
+  else echo "关闭"; fi
+}
+
+wiz_edit_buy() {
+  local ch v
+  wiz_header
+  echo "    ---- FTS 自动买入 (默认关闭) ----"
+  echo "      监控市场挂单，当单价低于你设定的值时代为吃单；总额不超过上限。"
+  echo "      阈值不设默认值，必须自己填。留空=不启用对应限制。"
+  echo "    当前: $(wiz_buy_text)"
+  echo "      [1] 开启/修改    [2] 关闭"
+  read -r -p "    请选择 [1/2]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  if [ "$ch" != "1" ]; then WIZ_BUY_ON="0"; return; fi
+  WIZ_BUY_ON="1"
+  read -r -p "    最高买入单价 (USDT/FTS，如 0.45，留空不设): " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  if [ -n "$v" ]; then
+    if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] && [ "$(echo "$v > 0" | bc 2>/dev/null || echo 1)" = "1" ]; then WIZ_BUY_MAX_PRICE="$v"; else warn_msg "无效数字，保持原值"; fi
+  fi
+  read -r -p "    买入总额上限 (USDT，留空不设): " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  if [ -n "$v" ]; then
+    if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then WIZ_BUY_MAX_TOTAL="$v"; else warn_msg "无效数字，保持原值"; fi
+  fi
+  sleep 1
+}
+
+wiz_sell_text() {
+  if [ "$WIZ_SELL_ON" = "1" ]; then
+    if [ "$WIZ_SELL_MODE" = "fixed" ]; then
+      echo "开启 (固定价 ${WIZ_SELL_PRICE:-未设}U, 数量 ${WIZ_SELL_AMOUNT:-未设} FTS)"
+    else
+      echo "开启 (时价减 ${WIZ_SELL_PRICE:-未设}U, 数量 ${WIZ_SELL_AMOUNT:-未设} FTS)"
+    fi
+  else echo "关闭"; fi
+}
+
+wiz_edit_sell() {
+  local ch v
+  wiz_header
+  echo "    ---- FTS 自动卖出 (默认关闭) ----"
+  echo "      读取 FTS 真实价格(DEX池储备，不读市场挂单价)。达到条件时自动挂单。"
+  echo "      阈值不设默认值，必须自己填。"
+  echo "    当前: $(wiz_sell_text)"
+  echo "      [1] 开启/修改    [2] 关闭"
+  read -r -p "    请选择 [1/2]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  if [ "$ch" != "1" ]; then WIZ_SELL_ON="0"; return; fi
+  WIZ_SELL_ON="1"
+  echo "      卖出价模式:"
+  echo "        [1] 固定价: 真实价 >= 你设的值时，按该价挂单"
+  echo "        [2] 时价减差值: 挂单价 = 真实价 - 你设的差值"
+  read -r -p "    请选择 [1/2]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  if [ "$ch" = "2" ]; then WIZ_SELL_MODE="spotminus"; else WIZ_SELL_MODE="fixed"; fi
+  if [ "$WIZ_SELL_MODE" = "fixed" ]; then
+    read -r -p "    固定卖出单价 (USDT/FTS，留空不设): " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  else
+    read -r -p "    时价减多少 (USDT/FTS，如 0.02，留空不设): " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  fi
+  if [ -n "$v" ]; then
+    if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then WIZ_SELL_PRICE="$v"; else warn_msg "无效数字，保持原值"; fi
+  fi
+  read -r -p "    卖出数量 (FTS，留空不设): " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  if [ -n "$v" ]; then
+    if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then WIZ_SELL_AMOUNT="$v"; else warn_msg "无效数字，保持原值"; fi
+  fi
+  sleep 1
+}
+
 # ---- 推荐人自动检测(读链上 referrerOfV2) ----
 detect_referrer() {
   printf '%s' "$1" | node -e '
@@ -760,6 +862,8 @@ wiz_defaults() {
       WIZ_CLAIM="20"; WIZ_BNB="0.005"
       WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_MINER_MODE="old"; WIZ_CLAIM_WIN="1"
       WIZ_FLEX="0"
+      WIZ_BUY_ON="0"; WIZ_BUY_MAX_PRICE=""; WIZ_BUY_MAX_TOTAL=""
+      WIZ_SELL_ON="0"; WIZ_SELL_MODE="fixed"; WIZ_SELL_PRICE=""; WIZ_SELL_AMOUNT=""
       ok_msg "已恢复默认(尚未保存)" ;;
     *) echo "    已取消" ;;
   esac
@@ -778,6 +882,8 @@ wiz_commit() {
   WIZ_GAS_MULT="$WIZ_GAS_MULT" WIZ_CLAIM="$WIZ_CLAIM" WIZ_BNB="$WIZ_BNB" \
   WIZ_MINER="$WIZ_MINER" WIZ_MINER_USD="$WIZ_MINER_USD" WIZ_MINER_MODE="$WIZ_MINER_MODE" WIZ_CLAIM_WIN="$WIZ_CLAIM_WIN" \
   WIZ_FLEX="$WIZ_FLEX" \
+  WIZ_BUY_ON="$WIZ_BUY_ON" WIZ_BUY_MAX_PRICE="$WIZ_BUY_MAX_PRICE" WIZ_BUY_MAX_TOTAL="$WIZ_BUY_MAX_TOTAL" \
+  WIZ_SELL_ON="$WIZ_SELL_ON" WIZ_SELL_MODE="$WIZ_SELL_MODE" WIZ_SELL_PRICE="$WIZ_SELL_PRICE" WIZ_SELL_AMOUNT="$WIZ_SELL_AMOUNT" \
   WIZ_UPDATE_TOKEN="$WIZ_UPDATE_TOKEN" \
   node -e '
     const fs = require("fs");
@@ -804,6 +910,18 @@ wiz_commit() {
     c.FLEX_FUND_AGGREGATION = c.FLEX_DECISION;
     c.UPDATE_TOKEN = String(e.WIZ_UPDATE_TOKEN || "").trim();
     c.AUTO_UPDATE = c.UPDATE_TOKEN.length > 0;
+    // FTS 自动买卖: 开关默认关；阈值只在用户填了才写入(不设默认值)
+    c.TRADE_BUY_ENABLED = String(e.WIZ_BUY_ON) === "1";
+    if (String(e.WIZ_BUY_MAX_PRICE || "").trim() !== "") c.TRADE_BUY_MAX_PRICE = Number(e.WIZ_BUY_MAX_PRICE);
+    else delete c.TRADE_BUY_MAX_PRICE;
+    if (String(e.WIZ_BUY_MAX_TOTAL || "").trim() !== "") c.TRADE_BUY_MAX_TOTAL = Number(e.WIZ_BUY_MAX_TOTAL);
+    else delete c.TRADE_BUY_MAX_TOTAL;
+    c.TRADE_SELL_ENABLED = String(e.WIZ_SELL_ON) === "1";
+    c.TRADE_SELL_MODE = String(e.WIZ_SELL_MODE || "fixed");
+    if (String(e.WIZ_SELL_PRICE || "").trim() !== "") c.TRADE_SELL_PRICE = Number(e.WIZ_SELL_PRICE);
+    else delete c.TRADE_SELL_PRICE;
+    if (String(e.WIZ_SELL_AMOUNT || "").trim() !== "") c.TRADE_SELL_AMOUNT = Number(e.WIZ_SELL_AMOUNT);
+    else delete c.TRADE_SELL_AMOUNT;
     const tmp = "config.json.tmp";
     fs.writeFileSync(tmp, JSON.stringify(c, null, 2) + "\n");
     // rename 失败时清掉 .tmp，别在目录里留垃圾
@@ -846,6 +964,7 @@ wiz_menu() {
   echo "      [7] 账号管理          [8] 恢复默认值"
   echo "      [9] 中奖处理/组矿机   [10] 自动更新"
   echo "      [11] 灵活资金决策     [12] 保存并退出"
+  echo "      [13] FTS自动买入      [14] FTS自动卖出"
   echo "      [0] 不保存退出"
   echo "  ────────────────────────────────────────────────────"
 }
@@ -869,6 +988,8 @@ wizard_main() {
       9) wiz_edit_miner ;;
       10) wiz_edit_update ;;
       11) wiz_edit_flex ;;
+      13) wiz_edit_buy ;;
+      14) wiz_edit_sell ;;
       12) if wiz_commit; then return 0; fi ;;
       0) echo ""; echo "  已退出，未做任何修改"; return 1 ;;
       *) ;;
