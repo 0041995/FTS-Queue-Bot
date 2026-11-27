@@ -6,9 +6,11 @@
  *   - APPROVE_ROUNDS 非整数(1.5)  -> BigInt(1.5) 抛 RangeError
  *   - APPROVE_USD 过大(>=1e21)     -> String() 变成 "1e+21"，parseUnits 不认
  *   - APPROVE_USD 为负            -> parseUnits 能过，但 approve(uint256) 编码时炸
- * 异常从 ensureFunds 冒到抢单流程的 catch，账号每轮都在这里失败，且日志被节流后几乎看不见。
  *
- * 做法: 把 validateCfg / ensureFunds 从 src/core.js 里整段抽出来，注入桩函数跑一遍。
+ * v1.7.1 追加: 填 0 不再等于"授权全部余额"、按场数/按 U 数分别有硬上限、
+ *              余额不足一轮票价时不发无意义 approve。
+ *
+ * 做法: 把 validateCfg / computeApproveTarget / ensureFunds 从 src/core.js 里整段抽出来，注入桩函数跑一遍。
  *
  * 用法: node test/approve-guard.js
  */
@@ -19,7 +21,7 @@ let ethers;
 try {
   ethers = require('ethers');
 } catch (e) {
-  console.error('本测试需要 ethers: 在仓库根目录执行 npm install ethers@6');
+  console.error('本测试需要 ethers: 在仓库根目录执行 npm install ethers@6.15.0');
   process.exit(2);
 }
 
@@ -37,9 +39,16 @@ function extract(name) {
   }
   return text.slice(start, end);
 }
+function ex(a, b) {
+  const i = text.indexOf(a), j = text.indexOf(b, i);
+  if (i < 0 || j < 0) throw new Error(`抽取标记缺失: ${a} / ${b}`);
+  return text.slice(i, j);
+}
 
 const validateSrc = extract('function validateCfg() {');
 const ensureSrc = extract('async function ensureFunds(inst, ticketPrice, room) {');
+const computeSrc = ex('function computeApproveTarget(', 'async function ensureFunds(');
+const computeApproveTarget = new Function(computeSrc + '\nreturn computeApproveTarget;')();
 
 const CFG = {};
 const cfgProblems = [];   // validateCfg 末尾会 concat 这个全局数组
@@ -62,6 +71,8 @@ function baseCfg() {
     CLAIM_LOOKBACK: 20, CLAIM_INTERVAL_MS: 30000,
     GAS_MIN_GWEI: 0.01, GAS_MAX_GWEI: 10, GAS_MULT: 1.25, GAS_FIXED_GWEI: 0.05,
     APPROVE_ROUNDS: 1, APPROVE_USD: null,
+    APPROVE_MAX_ROUNDS: 3, APPROVE_MAX_USD: 100,
+    UPDATE_RETRY_MS: 60000, TRADE_SELL_COOLDOWN_MS: 300000, TRADE_SELL_MAX_ORDERS: 1,
     MIN_BNB_GAS: 0.005, ACCOUNT_STAGGER_MS: 100, RPC_TIMEOUT_MS: 12000
   };
 }
@@ -89,19 +100,23 @@ Object.assign(CFG, baseCfg(), { APPROVE_USD: 0.0000001 });
 makeValidate()();
 check('APPROVE_USD=1e-7 不被误判(保持原值)', CFG.APPROVE_USD === 0.0000001, `实际 ${CFG.APPROVE_USD}`);
 
+Object.assign(CFG, baseCfg(), { APPROVE_MAX_ROUNDS: 999 });
+makeValidate()();
+check('APPROVE_MAX_ROUNDS 收敛到 20 以内', CFG.APPROVE_MAX_ROUNDS === 20, `实际 ${CFG.APPROVE_MAX_ROUNDS}`);
+
 // ============ 2. ensureFunds 不抛异常 ============
 console.log('\n--- ensureFunds ---');
 
 const TICKET = ethers.parseUnits('10', 18);   // 一轮 10U
 const BAL = ethers.parseUnits('100', 18);
 
-function makeEnsure(cfg) {
+function makeEnsure(cfg, balOverride) {
   Object.assign(CFG, cfg);
   let approved = null;
   const inst = {
     address: '0xTest',
     usdt: {
-      balanceOf: async () => BAL,
+      balanceOf: async () => (balOverride === undefined ? BAL : balOverride),
       allowance: async () => 0n
     },
     provider: { getBalance: async () => ethers.parseEther('1') },
@@ -110,6 +125,7 @@ function makeEnsure(cfg) {
   const stubs = {
     CFG,
     ethers,
+    computeApproveTarget,
     mgr: { rpc: async (fn) => fn(inst) },
     info: () => { }, err: () => { }, errOnce: () => { }, warnOnce: () => { },
     formatError: (e) => e.message || String(e),
@@ -127,7 +143,11 @@ function makeEnsure(cfg) {
     ['APPROVE_USD=1e30', { APPROVE_ROUNDS: 1, APPROVE_USD: 1e30 }, TICKET],
     ['APPROVE_USD=-5', { APPROVE_ROUNDS: 1, APPROVE_USD: -5 }, TICKET],
     ['APPROVE_USD=100', { APPROVE_ROUNDS: 1, APPROVE_USD: 100 }, ethers.parseUnits('100', 18)],
-    ['APPROVE_USD=1e-7', { APPROVE_ROUNDS: 1, APPROVE_USD: 0.0000001 }, TICKET]
+    ['APPROVE_USD=1e-7', { APPROVE_ROUNDS: 1, APPROVE_USD: 0.0000001 }, TICKET],
+    // v1.7.1 新增
+    ['APPROVE_USD=0 不再=全部余额', { APPROVE_ROUNDS: 1, APPROVE_USD: 0 }, TICKET],
+    ['APPROVE_ROUNDS=100 收敛到 3 场', { APPROVE_ROUNDS: 100, APPROVE_USD: null }, TICKET * 3n],
+    ['APPROVE_USD=1000 压到 100U', { APPROVE_ROUNDS: 1, APPROVE_USD: 1000 }, ethers.parseUnits('100', 18)]
   ];
 
   for (const [name, cfg, expect] of cases) {
@@ -139,6 +159,22 @@ function makeEnsure(cfg) {
     check(`${name}: 授权额 = ${ethers.formatUnits(expect, 18)}U`,
       got !== null && got === expect, got === null ? '没发起授权' : ethers.formatUnits(got, 18) + 'U');
   }
+
+  // 余额不足一轮票价: 不发注定无意义的 approve
+  {
+    const h = makeEnsure(baseCfg(), ethers.parseUnits('1', 18));
+    let ret = null;
+    try { ret = await h.run(); } catch (e) { ret = 'THREW ' + e.message; }
+    check('余额 1U < 票价 10U: 不发起授权', h.getApproved() === null && ret === false, String(ret));
+  }
+
+  // computeApproveTarget 纯函数直接测
+  console.log('\n--- computeApproveTarget ---');
+  const c = (cfg, bal) => computeApproveTarget(TICKET, bal || BAL, Object.assign(baseCfg(), cfg), ethers.parseUnits);
+  check('0 -> 1 场且给出废弃提示', c({ APPROVE_USD: 0 }).target === TICKET && /废弃/.test(c({ APPROVE_USD: 0 }).note));
+  check('场数上限 3', c({ APPROVE_ROUNDS: 50 }).target === TICKET * 3n);
+  check('U 数上限 100', c({ APPROVE_USD: 500 }).target === ethers.parseUnits('100', 18));
+  check('余额不足返回 null', c({}, ethers.parseUnits('1', 18)) === null);
 
   console.log('');
   if (problems === 0) {

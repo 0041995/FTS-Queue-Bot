@@ -1,12 +1,15 @@
-# 构建产物（从 Releases 下载，不入库）
-/dist/
+# v1.7.1: dist/ 发行版产物入库，保证仓库里的 dist/ 与 Release 附件逐字节一致、可离线复现。
+# 旧版忽略 /dist/，导致"发行版"无法与源代码、README 一起提交核对。
 
 # 运行时在脚本所在目录生成的同名文件（只忽略根目录，别误伤 src/）
 /core.js
 /probe.js
+/update.js
 /logs/
 /wallets.json
 /config.json
+/trade-state.json
+/.update-cache.json
 /node_modules/
 /package.json
 /package-lock.json

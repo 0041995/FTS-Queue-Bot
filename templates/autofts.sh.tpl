@@ -38,7 +38,7 @@ usage() {
   --init       打开配置向导(房间/抢位区间/延迟/手续费/账号)，配完即退出
   --settings   同 --init，随时回来改设置
   --encrypt    加密 wallets.json(设置密码，运行时用 FTS_WALLET_PASSWORD 提供)
-  --sync-web   从游戏网页自动读取最新合约地址写入配置(换合约不用改代码)
+  --sync-web   从游戏网页探测合约地址(默认只提示，资金字段需显式允许才写回)
   --update     一键更新到最新版本(原地替换脚本，支持私有仓库)
   --stop       停止后台运行的引擎
   --help       查看本帮助
@@ -54,9 +54,11 @@ usage() {
   CLAIM_INTERVAL_MS  领取返利扫描间隔，默认 20000
   MIN_BNB_GAS        最低 BNB 提醒阈值，默认 0.005
   MINING_CLAIM_MS    矿机产出领取扫描间隔，默认 45000（只要可领就立刻领）
-  UPDATE_TOKEN       自动更新用的 GitHub 只读 token（在 --init 里配置）
+  UPDATE_TOKEN       可选：仅私有仓库需要的 GitHub 只读 token；公开仓库无需 token
+  AUTO_UPDATE        是否启用自动更新（默认关，需在 --init 的 [10] 显式开启）
   UPDATE_CHECK_MS    自动更新检查间隔，默认 1200000（20 分钟，仅在空闲窗口替换）
   MINER_ENABLED      是否自动组矿机；MINER_MODE=old/new/both
+  外联域名          BSC RPC/WSS、fatris.fans、api.github.com、registry.npmjs.org、1rpc.io
 HELP
   exit 0
 }
@@ -260,28 +262,29 @@ ok_msg "Node $(node -v) / npm $(npm -v 2>/dev/null || echo '?')"
 strip_bom config.json
 strip_bom wallets.json
 
-# --- ethers ---
+# --- ethers (v1.7.1: 固定精确版本 + 禁安装脚本 + 装完校验版本，不再回退第三方镜像) ---
+ETHERS_VERSION="6.15.0"
+WS_VERSION="8.18.0"
 if ! node -e "require('ethers')" >/dev/null 2>&1; then
-  echo "安装依赖 ethers@6 ..."
-  # 注意: 不要用 "npm config set registry"，那会永久改写用户的 ~/.npmrc。
-  # 这里只在"默认源失败"时临时带 --registry 参数重试，不改任何全局配置。
+  echo "安装依赖 ethers@$ETHERS_VERSION (固定版本，禁止安装脚本)..."
   for i in 1 2 3; do
-    npm install ethers@6 --no-audit --no-fund && break
+    npm install "ethers@$ETHERS_VERSION" --no-audit --no-fund --ignore-scripts --save-exact && break
     warn_msg "第 $i 次安装失败，2 秒后重试..."
     sleep 2
   done
-  if ! node -e "require('ethers')" >/dev/null 2>&1; then
-    warn_msg "默认源安装失败，改用国内镜像临时重试(不改你的 npm 配置)..."
-    npm install ethers@6 --no-audit --no-fund --registry=https://registry.npmmirror.com || true
-  fi
-  node -e "require('ethers')" >/dev/null 2>&1 || die "ethers 安装失败，请手动执行: cd $WORK_DIR && npm install ethers@6"
+  # 光 require 成功不够: 必须确认装到的就是锁定的版本
+  node -e "const v=require('ethers').version; if(v!=='$ETHERS_VERSION'){console.error('ethers version mismatch: '+v);process.exit(1)}" \
+    || die "ethers 版本校验失败，请手动执行: cd $WORK_DIR && npm install ethers@$ETHERS_VERSION --ignore-scripts --save-exact"
+  # 不再自动回退 registry.npmmirror.com：第三方镜像是供应链攻击面，
+  # 而 ethers 是持有明文私钥并签名的核心依赖。如需镜像请自行配置 npm registry 后重试。
 fi
 ok_msg "ethers $(node -e "console.log(require('ethers').version)" 2>/dev/null || echo '?') 已就绪"
 
 # --- ws (WebSocket 依赖，缺失时自动降级为 HTTP 轮询) ---
 if ! node -e "try{require('ws')}catch(e){process.exit(1)}" >/dev/null 2>&1; then
-  echo "安装 WebSocket 依赖 ws ..."
-  npm install ws --no-audit --no-fund >/dev/null 2>&1 || warn_msg "ws 安装失败，将自动使用 HTTP 轮询模式兜底(仍可正常工作)"
+  echo "安装 WebSocket 依赖 ws@$WS_VERSION ..."
+  npm install "ws@$WS_VERSION" --no-audit --no-fund --ignore-scripts --save-exact >/dev/null 2>&1 \
+    || warn_msg "ws 安装失败，将自动使用 HTTP 轮询模式兜底(仍可正常工作)"
 fi
 
 # ==============================================================
@@ -340,6 +343,8 @@ WIZ_GAS_MODE="fixed"; WIZ_GAS_FIXED="0.05"; WIZ_GAS_MAX="10"; WIZ_GAS_MULT="1.25
 WIZ_CLAIM="20"; WIZ_BNB="0.005"
 WIZ_MINER="0"; WIZ_MINER_USD="100"; WIZ_MINER_MODE="old"; WIZ_CLAIM_WIN="1"
 WIZ_UPDATE_TOKEN=""
+# v1.7.1: 自动更新开关与 token 解绑；默认关，公开仓库无需 token 也能检查更新
+WIZ_AUTO_UPDATE="0"
 # FTS 自动买卖(默认关、阈值留空不设默认值)
 WIZ_BUY_ON="0"; WIZ_BUY_MAX_PRICE=""; WIZ_BUY_MAX_TOTAL=""
 WIZ_SELL_ON="0"; WIZ_SELL_MODE="fixed"; WIZ_SELL_PRICE=""; WIZ_SELL_AMOUNT=""
@@ -375,6 +380,7 @@ wiz_load() {
       MINER_MODE)       case "$v" in old|new|both) WIZ_MINER_MODE="$v" ;; esac ;;
       FLEX)             case "$v" in 1) WIZ_FLEX="1" ;; *) WIZ_FLEX="0" ;; esac ;;
       UPDATE_TOKEN)     WIZ_UPDATE_TOKEN="$v" ;;
+      AUTO_UPDATE)      case "$v" in 1|true|on) WIZ_AUTO_UPDATE="1" ;; *) WIZ_AUTO_UPDATE="0" ;; esac ;;
       TRADE_BUY)        case "$v" in 1) WIZ_BUY_ON="1" ;; *) WIZ_BUY_ON="0" ;; esac ;;
       TRADE_BUY_MAX_PRICE) WIZ_BUY_MAX_PRICE="$v" ;;
       TRADE_BUY_MAX_TOTAL) WIZ_BUY_MAX_TOTAL="$v" ;;
@@ -415,6 +421,7 @@ wiz_load() {
     // 授权额度: APPROVE_USD 有值=按U数; 否则按场数(APPROVE_ROUNDS)
     if(c.APPROVE_USD!==undefined&&c.APPROVE_USD!==null){console.log("APPROVE_MODE=usd");put("APPROVE_USD",c.APPROVE_USD);}
     else{console.log("APPROVE_MODE=rounds");put("APPROVE_ROUNDS",c.APPROVE_ROUNDS);}
+    console.log("AUTO_UPDATE="+(c.AUTO_UPDATE===true||c.AUTO_UPDATE===1||c.AUTO_UPDATE==="true"?"1":"0"));
   ' 2>/dev/null)
   # 兼容旧配置里 CLAIM_INTERVAL_MS 直接是毫秒
   [ -n "$WIZ_CLAIM" ] || WIZ_CLAIM=20
@@ -590,26 +597,34 @@ wiz_edit_bnb() {
 }
 
 wiz_update_text() {
+  local sw="关"
+  [ "$WIZ_AUTO_UPDATE" = "1" ] && sw="开"
   if [ -n "$WIZ_UPDATE_TOKEN" ]; then
-    echo "已配置（${WIZ_UPDATE_TOKEN:0:4}****${WIZ_UPDATE_TOKEN: -4}）"
+    echo "自动更新=$sw | Token 已配置（${WIZ_UPDATE_TOKEN:0:4}****${WIZ_UPDATE_TOKEN: -4}）"
   else
-    echo "未配置（私有仓库不会自动更新）"
+    echo "自动更新=$sw | Token 未配置（公开仓库无需 token）"
   fi
 }
 
 wiz_edit_update() {
-  local tok
+  local ch tok
   wiz_header
-  echo "    ---- 自动更新（GitHub 只读 Token）----"
-  echo "      仓库是私有的，需要 GitHub token（Fine-grained: Contents = Read）"
-  echo "      直接回车 = 保持当前；输入 - = 清除并关闭自动更新"
+  echo "    ---- 自动更新开关 / Token ----"
+  echo "      公开仓库无需 token；只有私有仓库才需要 GitHub 只读 token"
+  echo "      自动更新默认关闭，开启后仍只在空闲窗口替换，不会打断抢单"
   echo "    当前: $(wiz_update_text)"
-  read -r -s -p "    粘贴 Token: " tok || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  read -r -p "    是否启用自动更新? [y/N]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  case "$ch" in
+    y|Y|1) WIZ_AUTO_UPDATE="1" ;;
+    n|N|0|"") WIZ_AUTO_UPDATE="0" ;;
+    *) warn_msg "无效选择，开关保持不变" ;;
+  esac
+  read -r -s -p "    粘贴 Token (仅私有仓库需要；直接回车保持，输入 - 清除): " tok || { echo; die "输入已结束(EOF)，配置向导退出"; }
   echo ""
   if [ -z "$tok" ]; then return 0; fi
   if [ "$tok" = "-" ]; then
     WIZ_UPDATE_TOKEN=""
-    ok_msg "已清除 Token（自动更新关闭）"
+    ok_msg "已清除 Token（不影响自动更新开关）"
     return 0
   fi
   case "$tok" in
@@ -617,7 +632,7 @@ wiz_edit_update() {
     *) warn_msg "看起来不像 GitHub token，仍按输入保存" ;;
   esac
   WIZ_UPDATE_TOKEN="$tok"
-  ok_msg "已保存 Token（仅写入本地 config.json）"
+  ok_msg "已保存 Token（明文写入本地 config.json，请自行收紧文件权限）"
 }
 
 wiz_edit_miner() {
@@ -744,9 +759,9 @@ wiz_edit_sell() {
 
 wiz_approve_text() {
   if [ "$WIZ_APPROVE_MODE" = "usd" ]; then
-    if [ "${WIZ_APPROVE_USD:-}" = "0" ]; then echo "按 U 数: 授权全部余额"; else echo "按 U 数: 每次授权 ${WIZ_APPROVE_USD:-未设} U"; fi
+    if [ "${WIZ_APPROVE_USD:-}" = "0" ]; then echo "按 U 数: 0 已废弃，将按 1 场票价授权"; else echo "按 U 数: 每次授权 ${WIZ_APPROVE_USD:-未设} U (上限 100U)"; fi
   else
-    echo "按场数: 每次授权 ${WIZ_APPROVE_ROUNDS:-1} 场的票价"
+    echo "按场数: 每次授权 ${WIZ_APPROVE_ROUNDS:-1} 场的票价 (上限 3 场)"
   fi
 }
 
@@ -756,18 +771,18 @@ wiz_edit_approve() {
   echo "    ---- 授权额度 (USDT approve 的大小) ----"
   echo "      每轮入场前都会检查授权，不足时自动补授权。这里决定补多少："
   echo "        按场数: 授权 = 当前房间票价 x 场数 (例如 10U 房 x 3 场 = 30U)"
-  echo "        按 U 数: 授权 = 固定金额 (填 0 = 授权钱包全部 USDT 余额)"
-  echo "      额度越大，后续几轮越不用重复授权；额度越小，资金占用越少。"
+  echo "        按 U 数: 授权 = 固定金额 (v1.7.1 起填 0 已废弃，按 1 场票价处理)"
+  echo "      上限: 按场数最多 3 场、按 U 数最多 100U。approve 不锁资金，减小的是 spender 可划走的上限，不是资金占用。"
   echo "    当前: $(wiz_approve_text)"
   echo "      [1] 按场数    [2] 按 U 数"
   read -r -p "    请选择 [1/2]: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
   if [ "$ch" = "2" ]; then
     WIZ_APPROVE_MODE="usd"
-    read -r -p "    每次授权多少 U (填 0 = 全部余额): " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
+    read -r -p "    每次授权多少 U (填 0 已废弃，将按 1 场票价): " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
     if [ -n "$v" ]; then
       if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then WIZ_APPROVE_USD="$v"; else warn_msg "无效数字，保持原值"; fi
     fi
-    [ -n "$WIZ_APPROVE_USD" ] || WIZ_APPROVE_USD="0"
+    [ -n "$WIZ_APPROVE_USD" ] || WIZ_APPROVE_USD="1"
   else
     WIZ_APPROVE_MODE="rounds"
     read -r -p "    每次授权多少场的票价 (整数，默认 1): " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
@@ -847,6 +862,12 @@ wiz_add_account() {
     const pk = (lines[0] || "").trim();
     const addr = (lines[1] || "").trim();
     const ref = (lines[2] || "").trim();
+    // v1.7.1: 落盘前即时校验私钥是否对应该地址，避免错的私钥明文写进 wallets.json
+    const { Wallet } = require("ethers");
+    const derived = new Wallet("0x" + pk).address;
+    if (derived.toLowerCase() !== addr.toLowerCase()) {
+      console.error("私钥与地址不匹配(实际 " + derived + ")，未写入"); process.exit(3);
+    }
     const d = JSON.parse(fs.readFileSync("wallets.json", "utf8"));
     if (d.wallets.some(w => String(w.ADDRESS).toLowerCase() === addr.toLowerCase())) {
       console.error("该地址已在列表中"); process.exit(2);
@@ -931,7 +952,7 @@ wiz_commit() {
   WIZ_BUY_ON="$WIZ_BUY_ON" WIZ_BUY_MAX_PRICE="$WIZ_BUY_MAX_PRICE" WIZ_BUY_MAX_TOTAL="$WIZ_BUY_MAX_TOTAL" \
   WIZ_SELL_ON="$WIZ_SELL_ON" WIZ_SELL_MODE="$WIZ_SELL_MODE" WIZ_SELL_PRICE="$WIZ_SELL_PRICE" WIZ_SELL_AMOUNT="$WIZ_SELL_AMOUNT" \
   WIZ_APPROVE_MODE="$WIZ_APPROVE_MODE" WIZ_APPROVE_ROUNDS="$WIZ_APPROVE_ROUNDS" WIZ_APPROVE_USD="$WIZ_APPROVE_USD" \
-  WIZ_UPDATE_TOKEN="$WIZ_UPDATE_TOKEN" \
+  WIZ_UPDATE_TOKEN="$WIZ_UPDATE_TOKEN" WIZ_AUTO_UPDATE="$WIZ_AUTO_UPDATE" \
   node -e '
     const fs = require("fs");
     let c = {};
@@ -956,7 +977,10 @@ wiz_commit() {
     c.FLEX_GAS_POOLING = c.FLEX_DECISION;
     c.FLEX_FUND_AGGREGATION = c.FLEX_DECISION;
     c.UPDATE_TOKEN = String(e.WIZ_UPDATE_TOKEN || "").trim();
-    c.AUTO_UPDATE = c.UPDATE_TOKEN.length > 0;
+    // v1.7.1: 自动更新开关与 token 解绑 —— 公开仓库没有 token 也照样能检查更新
+    c.AUTO_UPDATE = String(e.WIZ_AUTO_UPDATE) === "1";
+    c.WEB_AUTO_SYNC = false;                // 网页合约自动同步默认关闭
+    c.WEB_SYNC_ALLOW_FUNDS_KEYS = false;    // 资金相关字段默认冻结
     // FTS 自动买卖: 开关默认关；阈值只在用户填了才写入(不设默认值)
     c.TRADE_BUY_ENABLED = String(e.WIZ_BUY_ON) === "1";
     if (String(e.WIZ_BUY_MAX_PRICE || "").trim() !== "") c.TRADE_BUY_MAX_PRICE = Number(e.WIZ_BUY_MAX_PRICE);
@@ -971,8 +995,10 @@ wiz_commit() {
     else delete c.TRADE_SELL_AMOUNT;
     // 授权额度: 按U数写 APPROVE_USD(删 APPROVE_ROUNDS)；按场数反之
     if (String(e.WIZ_APPROVE_MODE) === "usd") {
-      c.APPROVE_USD = Number(String(e.WIZ_APPROVE_USD || "0").trim() || 0);
-      delete c.APPROVE_ROUNDS;
+      // v1.7.1: 0 = 全部余额已废弃；向导与引擎都回落到"按场数 1"
+      const u = Number(String(e.WIZ_APPROVE_USD || "1").trim() || 1);
+      if (u > 0) { c.APPROVE_USD = u; delete c.APPROVE_ROUNDS; }
+      else { c.APPROVE_ROUNDS = 1; delete c.APPROVE_USD; }
     } else {
       c.APPROVE_ROUNDS = Math.max(1, Math.floor(Number(e.WIZ_APPROVE_ROUNDS || 1)));
       delete c.APPROVE_USD;
@@ -1017,7 +1043,7 @@ wiz_menu() {
   echo "      [3] 抢单延迟          [4] 手续费 / Gas"
   echo "      [5] 领取返利间隔      [6] 最低 BNB 余额"
   echo "      [7] 账号管理          [8] 恢复默认值"
-  echo "      [9] 中奖处理/组矿机   [10] 自动更新"
+  echo "      [9] 中奖处理/组矿机   [10] 自动更新开关 / Token"
   echo "      [11] 灵活资金决策     [12] 保存并退出"
   echo "      [13] FTS自动买入      [14] FTS自动卖出"
   echo "      [15] 授权额度"

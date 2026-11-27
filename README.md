@@ -4,9 +4,26 @@
 >
 > 帮你自动排队、自动领退款和 FTS 空投、自动处理中奖额度的本地小工具。
 > 不托管资金、不抽成、不联网上传私钥。
+>
+> **当前版本：v1.7.1**（安全加固版，详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)）
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Latest Release](https://img.shields.io/github/v/release/shishengh/FTS-Queue-Bot)](https://github.com/shishengh/FTS-Queue-Bot/releases/latest)
+[![Latest Release](https://img.shields.io/github/v/release/0041995/FTS-Queue-Bot)](https://github.com/0041995/FTS-Queue-Bot/releases/latest)
+
+---
+
+## v1.7.1 更新要点
+
+这是一次**安全修补**，没有新增玩法。如果你从 v1.7.0 升级，最重要的一句话：**两个自动入口现在默认关闭**，需要你显式决定要不要打开。
+
+- 网页合约同步不再能改写授权对象：RPC 不可用或校验失败时一个地址都不写回；资金相关字段默认冻结；`WEB_AUTO_SYNC` 默认 `false`。
+- 取消「填 0 授权全部余额」的旧行为：填 0 回落为 1 场票价；按场数模式最多 3 场、按 U 数模式最多 100 U。
+- 自动更新超时后**不再强制打断抢单**；开关与 GitHub token 解绑，公开仓库无需 token。
+- FTS 自动买卖修掉重复挂单、每日上限重启清零、多账号吃自己单、错误现货价四个 bug。
+- 依赖固定版本并禁止安装脚本、移除第三方 npm 镜像回退、Windows 不再自动装 Node；添加账号时即时校验私钥与地址是否匹配。
+- 版本号、README、`RELEASE_NOTES.md`、示例配置、构建产物、Release 附件全部对齐到 1.7.1。
+
+完整逐条说明与「已知限制」见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
 
 ---
 
@@ -26,7 +43,7 @@ Fatris 是 BSC 上的排队抽奖游戏：房间分 **10U / 50U / 100U**，每�
 
 ---
 
-## 2026-11 改版必读（v1.1.0）
+## 2026-11 改版必读（v1.1.0 起）
 
 游戏这次换了新合约，旧版脚本已经**完全失效**（会一直入场失败）。v1.1.0 已适配，同时把新规则做进来了：
 
@@ -62,14 +79,16 @@ Fatris 是 BSC 上的排队抽奖游戏：房间分 **10U / 50U / 100U**，每�
 
 ### 第 1 步｜下载
 
-到 [Releases](https://github.com/shishengh/FTS-Queue-Bot/releases/latest) 下载最新版：
+到 [Releases](https://github.com/0041995/FTS-Queue-Bot/releases/latest) 下载最新版：
 
 | 系统 | 文件 |
 |---|---|
 | Windows | `autofts.ps1` |
 | Linux / macOS / Termux | `autofts.sh` |
 
-放进一个**空文件夹**。需要 **Node.js 18+**（Windows 可 `winget install OpenJS.NodeJS.LTS`）。
+放进一个**空文件夹**。需要 **Node.js 18+**（Windows 可自行 `winget install OpenJS.NodeJS.LTS`；脚本**不会**替你安装运行时）。
+
+首次运行会固定安装 `ethers@6.15.0` / `ws@8.18.0`（带 `--ignore-scripts --save-exact`，装完校验版本）。脚本不再自动回退到第三方 npm 镜像；如果默认源不通，请自行配置 npm registry 后重试，或手动 `npm install ethers@6.15.0 --ignore-scripts --save-exact`。
 
 ### 第 2 步｜配置
 
@@ -85,6 +104,8 @@ bash autofts.sh --init
 
 按提示选房间、人数区间、添加账号（私钥只存在本地 `wallets.json`）。**改设置随时用 `--settings`。**
 
+`[7] 添加账号` 会在写入前即时校验「私钥是否对应该地址」，不匹配直接拒绝，不会把错的私钥明文落盘。
+
 ### 第 3 步｜先看再跑
 
 ```
@@ -92,6 +113,8 @@ bash autofts.sh --init
 --selftest   只读体检：节点、合约、余额、授权、交易预演
 --dry-run    全流程演练：交易不上链
 --run        正式运行
+--sync-web   从网页探测合约地址（默认只提示，资金字段需显式允许才写回）
+--update     手动一键更新
 --stop       停止
 ```
 
@@ -99,26 +122,17 @@ bash autofts.sh --init
 
 ---
 
-## 自动更新（私有仓库也能用）
+## 自动更新
 
-脚本**运行中每 20 分钟**检查一次新版本（`UPDATE_CHECK_MS` 可调），而且只在**空闲窗口**才动手：
+**默认关闭**（`AUTO_UPDATE: false`）。要用的话在 `--init` → `[10]` 里显式打开，或手改 `config.json`。打开后：
 
-- 空闲 = 没有轮次接近满员、没有交易在途（全部从链上状态判断）
-- 发现新版先记下来，进入空闲窗口再下载、校验 SHA256、原地替换，然后**自动重启自己**
-- 全程不打断抢单，也不需要你手动覆盖文件；启动时**不会**检查更新
-- 也可以手动一键更新：
+- **启动时立即检测一次**，之后每 20 分钟检查一次（`UPDATE_CHECK_MS` 可调）
+- 发现新版先记下来，只在**空闲窗口**下载、校验、原地替换，然后自动重启
+- 空闲 = 没有轮次接近满员 / 不在抢位区间 / 没有交易在途 / 不在结算开轮中
+- 连续等不到空闲窗口超过 2 小时也**只提示你手动 `--update`，不会强制打断抢单**
+- 失败重试间隔 `UPDATE_RETRY_MS`（默认 60 秒）；遇到 GitHub API 限流会退避 15 分钟，不会每 10 秒刷一次 API
 
-```bash
-./autofts.sh --update          # Linux / Termux
-```
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\autofts.ps1 --update
-```
-
-Release 里还附带 `update.sh` / `update.ps1`，双击/执行即可完成同样的事。
-
-**私有仓库**：GitHub 的 releases 接口需要鉴权。推荐在 `--init` → `[10] 自动更新` 里粘贴只读 token（下载来的脚本本身不带任何 token）；也可以手改 `config.json`：
+**公开仓库不需要 token**。只有私有仓库才需要 GitHub 只读 token（`--init` → `[10]`，或环境变量 `FTS_UPDATE_TOKEN`）：
 
 ```json
 {
@@ -128,11 +142,35 @@ Release 里还附带 `update.sh` / `update.ps1`，双击/执行即可完成同�
 }
 ```
 
-也可以改用环境变量 `FTS_UPDATE_TOKEN`（不落盘）。没有 token 时公开仓库照常更新，私有仓库会静默跳过并在 `--update` 时提示。
+⚠️ `UPDATE_TOKEN` 是**明文写进 `config.json`** 的，请自行收紧文件权限、不要提交到 Git 或发聊天工具。「下载来的脚本本身不带 token」只说明发行文件，不等于配置文件里没有。
 
 > 更新只替换 `autofts.sh` / `autofts.ps1` 本身，`wallets.json`、`config.json`、`logs/` 都不会动；下载失败或校验不通过时**不会覆盖**，旧版继续可用。
 
 > Windows 用户请用 `autofts.ps1`：它会自动收紧钱包文件权限；Git Bash 里跑 `.sh` 版没有这层保护。
+
+**校验链的边界（请看清）**：`SHA256SUMS.txt` 与脚本来自**同一个 GitHub Release**，没有离线签名或固定公钥作为独立信任根。v1.7.1 增加了用 Release API 的 `digest` 对脚本本体和校验和文件做交叉校验，但能发布 Release 的人理论上仍可同时替换两者。最稳妥的做法是自己 `python3 build/build.py` 重建后 `sha256sum -c SHA256SUMS.txt` 比对，或干脆保持 `AUTO_UPDATE: false` 手动更新。
+
+---
+
+## 网页合约同步
+
+游戏前端把合约地址写在 `VITE_P2_*` 映射里。本工具可以从网页探测，但 v1.7.1 起**默认只用 `config.json` 里你自己核对过的固定地址**：
+
+| 设置 | 默认 | 说明 |
+|---|---|---|
+| `WEB_AUTO_SYNC` | `false` | 是否在启动后台自动探测并写回。默认关 |
+| `WEB_SYNC_ALLOW_FUNDS_KEYS` | `false` | 是否允许改写资金相关字段（`QUEUE_ADDR` / `USDT_ADDR` / `MINER_QUEUE_ADDR` / `MARKET_ADDR`）。默认冻结 |
+
+手动执行 `--sync-web` 会打印每个地址、每个被拒绝字段及原因。安全规则：
+
+1. 链上校验必须**显式通过**；RPC 不可用 / 节点报错 / `getCode` 为空，**一个地址都不写回**
+2. 只有 `VITE_*` 字面量映射命中、且字段在白名单里才可能写回
+3. ABI 函数特征识别只作为**提示**，绝不用于写回（它是极宽松的文本启发式，容易认错地址）
+4. 资金相关字段默认冻结，需显式 `WEB_SYNC_ALLOW_FUNDS_KEYS: true`
+
+> 旧版在 RPC 掉线时会把网页上任意地址无条件写进 `config.json`，下一次启动就把它当成 USDT `approve` 的 spender —— 这是 v1.7.1 重点堵住的链路。
+
+**扫描范围是「有上限的抽样」，不是全站全量**：完整扫描最多 15 个页面 / 40 个 JS、chunk 只递归 2 轮；启动时若开启自动同步，走轻量扫描最多 8 个 JS。页面链接来自 HTML 的 `<a href>`，SPA 路由按白名单前缀提取，VITE 映射只认字面量正则；压缩后变成变量引用或 `import.meta.env` 就抓不到。`FTS_ADDR` / `PAIR_ADDR` 是 v1.7.0 里两个永远没人读的死键，v1.7.1 已移除（现货价本来就从市场合约的 `fts()` / `pair()` / `usdt()` 读取）。
 
 ---
 
@@ -150,9 +188,9 @@ Release 里还附带 `update.sh` / `update.ps1`，双击/执行即可完成同�
 | **中奖处理** | 自动领取 | 中奖后 48 小时内自动领额度；也可以选"不领取"（放弃该奖励） |
 | **组矿机** | 关 | 开启后选模式：只用老额度 / 只用新版额度 / 两者都组 |
 | **老系统固定支付** | 100 USDT | 仅老系统模式用；额度再高也只扣这个数 |
-| **FTS 自动买入** | 关 | 监控市场挂单，单价≤你设的值时自动吃单，总额不超上限（阈值必须自己填） |
-| **FTS 自动卖出** | 关 | 读 DEX 池真实价（不读挂单价），达条件自动挂单；支持固定价或"时价减差值" |
-| **授权额度** | 按场数 1 | 每轮检查授权、不足自动补。可选"按场数"（票价×场数）或"按 U 数"（固定金额，填 0 = 全部余额） |
+| **FTS 自动买入** | 关 | 监控市场挂单，单价≤你设的值时自动吃单；每日累计花费落盘，重启不清零 |
+| **FTS 自动卖出** | 关 | 读 DEX 池真实价，达条件挂单；有冷却、累计上限、已有挂单检查，不会无限重复挂 |
+| **授权额度** | 按场数 1 | 每轮检查授权、不足自动补。可选"按场数"（票价×场数）或"按 U 数"（固定金额）。**按场数模式最多 3 场、按 U 数模式最多 100 U；填 0 已废弃，按 1 场处理** |
 
 ---
 
@@ -191,18 +229,20 @@ Release 里还附带 `update.sh` / `update.ps1`，双击/执行即可完成同�
 ## 安全与隐私
 
 - **私钥不出本机**：只存在运行目录的 `wallets.json`，不上传、不回传。Windows 版自动收紧文件权限。
-- **支持加密存储**：跑一次 `--encrypt` 设置密码，`wallets.json` 会变成 AES-256-GCM 密文（scrypt 派生密钥，随机 salt，篡改会被认证拒绝）。运行时用环境变量 `FTS_WALLET_PASSWORD` 提供密码，明文私钥只在内存短暂停留，不写日志、不回显。**密码务必记住，丢失无法恢复。**
-- **不做无限授权**：按当前票价/组机金额精确授权，不签空白支票。
+- **支持加密存储**：跑一次 `--encrypt` 设置密码，`wallets.json` 会变成 AES-256-GCM 密文（scrypt 派生密钥，随机 salt，篡改会被认证拒绝）。运行时用环境变量 `FTS_WALLET_PASSWORD` 提供密码。⚠️ 环境变量可被同机 `/proc/<pid>/environ` 等途径读到，且写进 shell 命令会留在 history；请自行评估。JS 字符串不可变，明文无法可靠清零，真正的保护来自文件权限与加密。
+- **授权按轮、有硬上限**：默认每轮只授权一轮票价；按场数最多 3 场、按 U 数最多 100 U；**不做无限授权**，`approve` 也不会锁定你的资金。v1.7.1 起「填 0 = 全部余额」已废弃。注意：减小额度减小的是 **spender 可划走的上限**，不是「资金占用」；已授权但尚未消耗的额度会一直留在链上，直到被消耗或撤销。
 - **只读模式可验证**：`--probe` / `--selftest` 不需要私钥、不花一分钱。
-- **完全开源**：代码在 `src/`，产物由 `build/build.py` 生成，可自行构建。
-- **无后台服务**：脚本只跟 BSC 节点和游戏合约通信。
+- **完全开源**：代码在 `src/`，产物由 `build/build.py` 生成，`dist/` 也随仓库入库，可自行构建比对。
+- **外联域名（可枚举）**：BSC RPC / WSS 节点、`fatris.fans`（网页合约探测）、`api.github.com` 与 `github.com`（检查更新、下载附件）、`registry.npmjs.org`（安装依赖）、`1rpc.io` 与 `bsc-rpc.publicnode.com`（推荐人自动识别）、文档里提到的 `nodejs.org`。**没有后台服务，也没有把私钥或 `wallets.json` 主动外传的代码**；但「只跟 BSC 节点和游戏合约通信」是不准确的旧说法。
+- **转账能力（默认关）**：`FLEX_DECISION` 开启后会转 BNB / USDT 给自有账号，`startGapFixer()` 会发 0 值自转，FTS 买卖会 `fillOrder` / `createOrder`。所以「完全没有转账能力」是不准确的旧说法 —— 这些路径默认关闭，且只面向你自己的账号。
+- **依赖供应链**：`ethers` / `ws` 固定精确版本、带 `--ignore-scripts --save-exact`，装完校验版本；不再自动回退第三方镜像。npm 自身会校验 registry 返回的包完整性，但没有随仓库附带 lockfile，这是已知边界。
 
 ⚠️ `wallets.json` **就是你的私钥**。别同步网盘、别发聊天工具、别提交 Git，务必用专门的小号钱包。
 
 > 加密用法：
 > ```
 > bash autofts.sh --encrypt          # 设置密码（至少8位）
-> export FTS_WALLET_PASSWORD=你的密码  # 运行前提供
+> export FTS_WALLET_PASSWORD=你的密码  # 运行前提供（注意 history 风险）
 > bash autofts.sh --run
 > ```
 
@@ -220,13 +260,13 @@ Release 里还附带 `update.sh` / `update.ps1`，双击/执行即可完成同�
 奖励作废，额度不补。脚本默认会自动领取；如果你手动关了，记得自己盯着。
 
 **Q：推荐人地址怎么填？**
-直接回车即可，脚本会读链上的 `referrerOfV2` 自动识别你已绑定的推荐人；查不到就自动用零地址（无推荐人），不影响入场。
+直接回车即可，脚本会读链上的 `referrerOfV2` 自动识别你已绑定的推荐人（会访问 `1rpc.io` / `bsc-rpc.publicnode.com`）；查不到就自动用零地址（无推荐人），不影响入场。
 
 **Q：真的能赚钱吗？**
 它保证"不漏领"，不保证"一定赚"。收益取决于你中奖的运气和 FTS 的价格。
 
 **Q：会不会把我钱包里的钱转走？**
-不会。它只调用入场、领取、授权、组机这几类接口，没有任意转账能力。但私钥是明文存本地的，机器安全靠你自己。
+脚本里**没有把资金转到外部地址的能力**：入场、领取、授权、组机都只跟游戏合约交互。但「完全没有转账能力」不准确 —— 默认关闭的灵活资金决策会在你自己的账号之间转 BNB / USDT，nonce 自愈会发 0 值自转，FTS 买卖会对市场合约下单。真正的风险是私钥明文存本地，机器安全靠你自己；请用专用小号、只放小额资金。
 
 **Q：多开账号会冲突吗？**
 不会，每个账号独立计数、独立领取。脚本用**多节点分层**：账号自动平摊到 11 个优质 BSC 节点（5 个官方 + 6 个公共），每个节点有独立并发闸门，某节点忙不过来或被限流时，请求自动落到其它节点并行处理。**实测 100 个账号同时跑：400 次请求分散到 11 个节点，零限流、零失败、约 4 秒完成**。
@@ -250,10 +290,14 @@ MIT，见 [LICENSE](LICENSE)。
 
 ## 给开发者
 
-源码在 `src/`，`build/build.py` 把引擎注入两个模板，生成 Releases 里的单文件脚本：
+源码在 `src/`，`build/build.py` 把引擎注入两个模板，生成 `dist/` 里的单文件脚本与 `SHA256SUMS.txt`；仓库里的 `0041995/FTS-Queue-Bot` 是唯一官方仓库。
 
 ```bash
-python3 build/build.py              # 产物在 dist/
+python3 build/build.py              # 产物在 dist/，同时生成 SHA256SUMS.txt
+cd dist && sha256sum -c SHA256SUMS.txt
+bash -n dist/autofts.sh
+node --check src/core.js && node --check src/probe.js && node --check src/update.js
+npm install ethers@6.15.0 --no-audit --no-fund --ignore-scripts --no-save
 node test/sendtx-nonce.js           # nonce 重发回归测试
 node test/approve-guard.js          # 授权额度边界（需 ethers）
 node test/claims-flex.js            # 领取健壮性 / 灵活资金决策 32 项（需 ethers）
@@ -263,13 +307,16 @@ node test/node-pool.js              # 多节点分层/溢出
 node test/wallet-crypto.js          # 钱包加密（AES-GCM）
 node test/web-sync.js               # 网页合约探测
 node test/trade.js                  # FTS 自动买卖逻辑
+node test/safety-guards.js          # 授权上限 / 同步白名单 / 现货价 / ABI 兜底
+node test/update-vercmp.js          # 版本比较 / 校验和 / 限流分类
+node test/release-consistency.js    # 版本号与发行产物一致性
 ```
 
-关键配置：`QUEUE_ADDR`（新队列）、`MINER_MODE`（old/new/both）、`MINER_USD`、`CLAIM_WIN`、`FLEX_DECISION`（灵活资金决策，默认 false）、`GAME_URL`/`WEB_AUTO_SYNC`（网页自动同步合约）、`TRADE_BUY_ENABLED`/`TRADE_SELL_ENABLED`（FTS 买卖，默认 false）。更细的字段和原理见源码注释。
+关键配置：`QUEUE_ADDR`（新队列）、`MINER_MODE`（old/new/both）、`MINER_USD`、`CLAIM_WIN`、`FLEX_DECISION`（灵活资金决策，默认 false）、`GAME_URL` / `WEB_AUTO_SYNC`（默认 false）/ `WEB_SYNC_ALLOW_FUNDS_KEYS`（默认 false）、`TRADE_BUY_ENABLED` / `TRADE_SELL_ENABLED`（默认 false）、`AUTO_UPDATE`（默认 false）。完整字段见 `config.example.json`。
 
-**换合约不用改代码**：游戏网页会把合约地址写在 `VITE_P2_*` 映射里。脚本会**广域扫描整个站点**——从配置的页面出发，抓同域下的其它页面链接、递归抓所有 JS chunk，解析全部 `VITE_*` 映射；VITE 键缺失或改名时，还会用 **ABI 函数特征**兜底识别（例如"地址附近出现 `nextOrderId`+`fillOrder`"就认定是市场合约）。校验链上代码存在后写回 `config.json`。
+**换合约不用改代码**：游戏网页会把合约地址写在 `VITE_P2_*` 映射里。脚本会做**有上限的抽样扫描**——从配置的页面出发，抓同域页面链接、递归 2 轮 JS chunk，解析字面量 `VITE_*` 映射；VITE 键缺失时还会用 ABI 函数特征做**提示性**识别（v1.7.1 起该结果不写回配置）。校验链上代码存在后，只有非资金字段且显式允许时才写回 `config.json`。
 
-- 启动时后台**轻量扫描**（约 8 个 JS，不拖带宽）
-- 手动 `--sync-web` 走**完整扫描**（同域所有页面 + 全部 chunk）
+- 启动时后台**轻量扫描**（最多 8 个 JS，且默认不自动同步）
+- 手动 `--sync-web` 走**完整扫描**（最多 15 页 / 40 个 JS）
 
-**启动即检测更新**：引擎启动时会立刻检查一次新版本（不再等一个周期），发现后仍只在空闲窗口应用，不会打断抢单。
+**自动更新**：默认关闭；开启后引擎启动即检测一次新版本，之后每 20 分钟检查，发现后只在空闲窗口应用，超时也**不会**强制打断抢单。发布由维护者打 `v*` tag 触发，Release 正文取自 `RELEASE_NOTES.md`。

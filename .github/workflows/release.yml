@@ -1,14 +1,9 @@
 name: Build & Release
 
+# v1.7.1: 不再"任何 push 到 main 就自动发版"。发布必须由维护者打 v* tag 或手动触发。
 on:
   push:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'templates/**'
-      - 'build/**'
-      - 'VERSION'
-      - '.github/workflows/release.yml'
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -29,7 +24,16 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: 构建单文件脚本
+      - name: 校验 VERSION 与 tag 一致
+        run: |
+          VERSION="$(tr -d ' \r\n' < VERSION)"
+          echo "VERSION=$VERSION"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 VERSION ${VERSION} 不一致"
+            exit 1
+          fi
+
+      - name: 构建单文件脚本与校验和
         run: python3 build/build.py
 
       - name: 校验 bash 语法
@@ -49,16 +53,18 @@ jobs:
           }
           Write-Host "PowerShell 语法 OK"
 
-      - name: 校验内嵌引擎
+      - name: 校验内嵌引擎与更新器
         run: |
           node --version
           node --check src/core.js
           node --check src/probe.js
+          node --check src/update.js
+          node --check dist/update.js
           echo "引擎语法 OK"
 
-      - name: 回归测试
+      - name: 回归测试（全部 13 项）
         run: |
-          npm install ethers@6 --no-audit --no-fund --no-save
+          npm install ethers@6.15.0 --no-audit --no-fund --ignore-scripts --no-save
           node test/sendtx-nonce.js
           node test/approve-guard.js
           node test/claims-flex.js
@@ -67,67 +73,30 @@ jobs:
           node test/rate-limits.js
           node test/node-pool.js
           node test/wallet-crypto.js
+          node test/web-sync.js
+          node test/trade.js
+          node test/safety-guards.js
+          node test/update-vercmp.js
+          node test/release-consistency.js
 
-      - name: 生成校验和
+      - name: 校验发行版校验和
         run: |
           cd dist
-          sha256sum autofts.sh autofts.ps1 update.sh update.ps1 update.js > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
 
-      - name: 发布 Release
+      - name: 发布 / 覆盖 Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="$(tr -d ' \r\n' < VERSION)"
           TAG="v${VERSION}"
+          ASSETS=(dist/autofts.sh dist/autofts.ps1 dist/update.sh dist/update.ps1 dist/update.js dist/SHA256SUMS.txt)
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG 已存在，跳过创建"
-            exit 0
+            echo "Release $TAG 已存在，覆盖附件并更新说明"
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+            gh release edit "$TAG" --title "$TAG" --notes-file RELEASE_NOTES.md
+          else
+            echo "创建 Release $TAG"
+            gh release create "$TAG" "${ASSETS[@]}" --title "$TAG" --notes-file RELEASE_NOTES.md
           fi
-
-          PREV_TAG="$(git describe --tags --abbrev=0 HEAD 2>/dev/null || true)"
-          {
-            echo "## 更新内容"
-            echo
-            if [ -n "$PREV_TAG" ]; then
-              git log --pretty='- %s' "${PREV_TAG}..HEAD" | head -30
-            else
-              git log --pretty='- %s' -20
-            fi
-            echo
-            printf '%s\n' \
-              '## 下载' \
-              '' \
-              '| 平台 | 文件 |' \
-              '|---|---|' \
-              '| Linux / Termux / macOS | `autofts.sh` |' \
-              '| Windows | `autofts.ps1` |' \
-              '' \
-              '两个脚本都是单文件，只需要 Node.js 18+。源码见 `src/`.' \
-              '' \
-              '## 首次使用' \
-              '' \
-              '```' \
-              '--probe  ->  --init  ->  --selftest  ->  --dry-run  ->  --run' \
-              '```' \
-              '' \
-              '`--probe` / `--selftest` 完全只读，不花一分钱。' \
-              '' \
-              '## 校验' \
-              '' \
-              '```' \
-              'sha256sum -c SHA256SUMS.txt' \
-              '```'
-          } > NOTES.md
-
-          gh release create "$TAG" \
-            dist/autofts.sh \
-            dist/autofts.ps1 \
-            dist/update.sh \
-            dist/update.ps1 \
-            dist/update.js \
-            dist/SHA256SUMS.txt \
-            --title "$TAG" \
-            --notes-file NOTES.md
-
-          echo "已发布 $TAG"
+          gh release view "$TAG" --json tagName,assets --jq '.tagName, (.assets[].name)'

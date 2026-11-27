@@ -140,7 +140,7 @@ function Show-Usage {
   --init       打开配置向导(房间/抢位区间/延迟/手续费/账号)，配完即退出
   --settings   同 --init，随时回来改设置
   --encrypt    加密 wallets.json(设置密码，运行时用 FTS_WALLET_PASSWORD 提供)
-  --sync-web   从游戏网页自动读取最新合约地址写入配置(换合约不用改代码)
+  --sync-web   从游戏网页探测合约地址(默认只提示，资金字段需显式允许才写回)
   --update     一键更新到最新版本(原地替换脚本，支持私有仓库)
   --stop       停止后台运行的引擎
   --help       查看本帮助
@@ -157,7 +157,9 @@ function Show-Usage {
   MIN_BNB_GAS        最低 BNB 提醒阈值，默认 0.005
   MINING_CLAIM_MS    矿机产出领取扫描间隔，默认 45000（只要可领就立刻领）
   MINER_ENABLED      是否自动组矿机；MINER_MODE=old/new/both
-  UPDATE_TOKEN       自动更新用的 GitHub 只读 token（在 --init 里配置）
+  外联域名          BSC RPC/WSS、fatris.fans、api.github.com、registry.npmjs.org、1rpc.io
+  UPDATE_TOKEN       可选：仅私有仓库需要的 GitHub 只读 token；公开仓库无需 token
+  AUTO_UPDATE        是否启用自动更新（默认关，需在 --init 的 [10] 显式开启）
   UPDATE_CHECK_MS    自动更新检查间隔，默认 1200000（20 分钟，仅在空闲窗口替换）
 '@
     exit 0
@@ -279,18 +281,8 @@ Write-Host "PowerShell $Script:PSVer ($($PSVersionTable.PSEdition))"
 # --- Node.js ---
 $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
 if (-not $nodeCmd) {
-    Write-WarnMsg "未找到 Node.js，尝试用 winget 安装..."
-    $winget = Get-Command winget -ErrorAction SilentlyContinue
-    if ($winget) { & $winget.Source install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements 2>&1 | Out-Host }
-    # winget 只改注册表里的 PATH，当前进程的环境变量不会自动刷新，
-    # 不重新读一遍的话下面 Get-Command node 大概率还是找不到
-    try {
-        $m = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
-        $u = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-        $env:PATH = (@($m, $u) | Where-Object { $_ }) -join ';'
-    } catch { }
-    $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
-    if (-not $nodeCmd) { Write-Die "未找到 Node.js。请安装 Node 18+ : https://nodejs.org/ 或 winget install OpenJS.NodeJS.LTS" }
+    # v1.7.1: 不再自动下载安装运行时 —— 自动装 Node 会静默扩大攻击面，且 PATH 刷新不可靠。
+    Write-Die "未找到 Node.js 18+。请自行安装: https://nodejs.org/ 或 winget install OpenJS.NodeJS.LTS"
 }
 $Script:NodeExe = $nodeCmd.Source
 $nodeVer = (& $Script:NodeExe -v 2>$null)
@@ -320,28 +312,26 @@ function Invoke-NodeJs {
     return $out
 }
 
-# --- ethers ---
+# --- ethers (v1.7.1: 固定精确版本 + 禁安装脚本 + 装完校验版本，不再回退第三方镜像) ---
+$Script:EthersVersion = '6.15.0'
+$Script:WsVersion = '8.18.0'
 $null = Invoke-NodeJs 'check-ethers' 'require("ethers");'
 if ($Script:LastNodeExit -ne 0) {
-    Write-Host "安装依赖 ethers@6 ..."
-    # 优先用 npm.cmd: Windows 上同时有 npm.cmd / npm.ps1，直接调 npm.ps1 会受执行策略限制
+    Write-Host "安装依赖 ethers@$($Script:EthersVersion) (固定版本，禁止安装脚本)..."
     $npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
     if (-not $npmCmd) { $npmCmd = Get-Command npm -ErrorAction SilentlyContinue }
     if (-not $npmCmd) { Write-Die "未找到 npm，请重装 Node.js" }
     $npmExe = $npmCmd.Source
     for ($t = 1; $t -le 3; $t++) {
-        & $npmExe install ethers@6 --no-audit --no-fund 2>&1 | Out-Host
+        & $npmExe install "ethers@$($Script:EthersVersion)" --no-audit --no-fund --ignore-scripts --save-exact 2>&1 | Out-Host
         $null = Invoke-NodeJs 'check-ethers' 'require("ethers");'
         if ($Script:LastNodeExit -eq 0) { break }
         Write-WarnMsg "第 $t 次安装失败，2 秒后重试..."
         Start-Sleep -Seconds 2
     }
-    if ($Script:LastNodeExit -ne 0) {
-        Write-WarnMsg "默认源安装失败，改用国内镜像临时重试(不改你的 npm 配置)..."
-        & $npmExe install ethers@6 --no-audit --no-fund --registry=https://registry.npmmirror.com 2>&1 | Out-Host
-        $null = Invoke-NodeJs 'check-ethers' 'require("ethers");'
-    }
-    if ($Script:LastNodeExit -ne 0) { Write-Die "ethers 安装失败，请手动执行: cd `"$Script:WorkDir`"; npm install ethers@6" }
+    # 光 require 成功不够: 必须确认装到的就是锁定的版本
+    $null = Invoke-NodeJs 'ver-ethers-check' "const v=require('ethers').version;if(v!=='$($Script:EthersVersion)'){console.error('version mismatch: '+v);process.exit(1)}"
+    if ($Script:LastNodeExit -ne 0) { Write-Die "ethers 版本校验失败，请手动执行: cd `"$Script:WorkDir`"; npm install ethers@$($Script:EthersVersion) --ignore-scripts --save-exact" }
 }
 $ethVer = Invoke-NodeJs 'ver-ethers' 'console.log(require("ethers").version);'
 Write-Ok "ethers $ethVer 已就绪"
@@ -352,7 +342,7 @@ if ($Script:LastNodeExit -ne 0) {
     Write-Host "安装 WebSocket 依赖 ws ..."
     $npmCmd2 = Get-Command npm.cmd -ErrorAction SilentlyContinue
     if (-not $npmCmd2) { $npmCmd2 = Get-Command npm -ErrorAction SilentlyContinue }
-    if ($npmCmd2) { & $npmCmd2.Source install ws --no-audit --no-fund 2>&1 | Out-Host }
+    if ($npmCmd2) { & $npmCmd2.Source install "ws@$($Script:WsVersion)" --no-audit --no-fund --ignore-scripts --save-exact 2>&1 | Out-Host }
     $null = Invoke-NodeJs 'check-ws' 'try{require("ws")}catch(e){process.exit(1)}'
     if ($Script:LastNodeExit -ne 0) { Write-WarnMsg "ws 安装失败，将自动使用 HTTP 轮询模式兜底(仍可正常工作)" }
 }
@@ -425,6 +415,7 @@ $Script:WizClaim = '20'; $Script:WizBnb = '0.005'
 $Script:WizMiner = '0'; $Script:WizMinerUsd = '100'; $Script:WizMinerMode = 'old'; $Script:WizClaimWin = '1'
 $Script:WizFlex = '0'
 $Script:WizUpdateToken = ''
+$Script:WizAutoUpdate = '0'   # v1.7.1: 自动更新开关与 token 解绑，默认关
 $Script:WizBuyOn = '0'; $Script:WizBuyMaxPrice = ''; $Script:WizBuyMaxTotal = ''
 $Script:WizSellOn = '0'; $Script:WizSellMode = 'fixed'; $Script:WizSellPrice = ''; $Script:WizSellAmount = ''
 $Script:WizApproveMode = 'rounds'; $Script:WizApproveRounds = '1'; $Script:WizApproveUsd = ''
@@ -466,6 +457,7 @@ put("TRADE_SELL_PRICE",c.TRADE_SELL_PRICE);
 put("TRADE_SELL_AMOUNT",c.TRADE_SELL_AMOUNT);
 if(c.APPROVE_USD!==undefined&&c.APPROVE_USD!==null){console.log("APPROVE_MODE=usd");put("APPROVE_USD",c.APPROVE_USD);}
 else{console.log("APPROVE_MODE=rounds");put("APPROVE_ROUNDS",c.APPROVE_ROUNDS);}
+console.log("AUTO_UPDATE="+(c.AUTO_UPDATE===true||c.AUTO_UPDATE===1||c.AUTO_UPDATE==="true"?"1":"0"));
 '@
     $lines = Invoke-NodeJs 'cfg-read' $code
     foreach ($l in $lines) {
@@ -494,6 +486,7 @@ else{console.log("APPROVE_MODE=rounds");put("APPROVE_ROUNDS",c.APPROVE_ROUNDS);}
                 'MINER_USD'         { if (Test-IsNum $v) { $Script:WizMinerUsd = $v } }
                 'CLAIM_WIN'         { if ($v -eq '1') { $Script:WizClaimWin = '1' } else { $Script:WizClaimWin = '0' } }
                 'UPDATE_TOKEN'      { $Script:WizUpdateToken = $v }
+                'AUTO_UPDATE'       { if ($v -eq '1' -or $v -eq 'true') { $Script:WizAutoUpdate = '1' } else { $Script:WizAutoUpdate = '0' } }
                 'MINER_MODE'        { if ($v -in @('old','new','both')) { $Script:WizMinerMode = $v } }
                 'FLEX'              { if ($v -eq '1') { $Script:WizFlex = '1' } else { $Script:WizFlex = '0' } }
                 'TRADE_BUY'         { if ($v -eq '1') { $Script:WizBuyOn = '1' } else { $Script:WizBuyOn = '0' } }
@@ -542,17 +535,23 @@ function Get-MinerText {
 }
 
 function Get-UpdateText {
-    if ([string]::IsNullOrWhiteSpace($Script:WizUpdateToken)) { return '未配置（私有仓库不会自动更新）' }
+    $sw = '关'
+    if ($Script:WizAutoUpdate -eq '1') { $sw = '开' }
+    if ([string]::IsNullOrWhiteSpace($Script:WizUpdateToken)) { return "自动更新=$sw | Token 未配置（公开仓库无需 token）" }
     $t = $Script:WizUpdateToken
-    if ($t.Length -gt 10) { return "已配置（" + $t.Substring(0, 4) + "****" + $t.Substring($t.Length - 4) + "）" }
-    return '已配置'
+    if ($t.Length -gt 10) { return "自动更新=$sw | Token 已配置（" + $t.Substring(0, 4) + "****" + $t.Substring($t.Length - 4) + "）" }
+    return "自动更新=$sw | Token 已配置"
 }
 
 function Edit-Update {
     Show-WizHeader
-    Write-Host "    ---- 自动更新（GitHub 只读 Token）----"
-    Write-Host "      仓库是私有的，需要 GitHub token（Fine-grained: Contents = Read）"
-    Write-Host "      直接回车 = 保持当前；输入 - = 清除并关闭自动更新"
+    $sw = Read-Menu "    是否启用自动更新? [y/N]（默认关；公开仓库无需 token）"
+    if ($sw -eq 'y' -or $sw -eq 'Y' -or $sw -eq '1') { $Script:WizAutoUpdate = '1' }
+    elseif ($sw -eq 'n' -or $sw -eq 'N' -or $sw -eq '0' -or [string]::IsNullOrWhiteSpace($sw)) { $Script:WizAutoUpdate = '0' }
+    Write-Host "    ---- 自动更新开关 / Token ----"
+    Write-Host "      公开仓库无需 token；只有私有仓库才需要 GitHub 只读 token"
+    Write-Host "      自动更新默认关闭，开启后仍只在空闲窗口替换，不会打断抢单"
+    Write-Host "      Token 直接回车 = 保持；输入 - = 仅清除 Token（不影响开关）"
     Write-Host "    当前: $(Get-UpdateText)"
     if ([Console]::IsInputRedirected) {
         $tok = "$(Read-Host '    粘贴 Token')".Trim()
@@ -563,10 +562,10 @@ function Edit-Update {
         $tok = "$tok".Trim()
     }
     if ([string]::IsNullOrWhiteSpace($tok)) { return }
-    if ($tok -eq '-') { $Script:WizUpdateToken = ''; Write-Ok "已清除 Token（自动更新关闭）"; return }
+    if ($tok -eq '-') { $Script:WizUpdateToken = ''; Write-Ok "已清除 Token（不影响自动更新开关）"; return }
     if ($tok -notmatch '^(gh[pousr]_\w+|github_pat_\w+)$') { Write-WarnMsg "看起来不像 GitHub token，仍按输入保存" }
     $Script:WizUpdateToken = $tok
-    Write-Ok "已保存 Token（仅写入本地 config.json）"
+    Write-Ok "已保存 Token（明文写入本地 config.json，请自行收紧文件权限）"
 }
 
 function Get-FlexText {
@@ -647,27 +646,27 @@ function Edit-Sell {
 
 function Get-ApproveText {
     if ($Script:WizApproveMode -eq 'usd') {
-        if ($Script:WizApproveUsd -eq '0') { return '按 U 数: 授权全部余额' }
+        if ($Script:WizApproveUsd -eq '0') { return '按 U 数: 0 已废弃，将按 1 场票价授权' }
         $u = if ($Script:WizApproveUsd) { $Script:WizApproveUsd } else { '未设' }
-        return "按 U 数: 每次授权 ${u} U"
+        return "按 U 数: 每次授权 ${u} U (上限 100U)"
     }
-    return "按场数: 每次授权 $($Script:WizApproveRounds) 场的票价"
+    return "按场数: 每次授权 $($Script:WizApproveRounds) 场的票价 (上限 3 场)"
 }
 function Edit-Approve {
     Show-WizHeader
     Write-Host "    ---- 授权额度 (USDT approve 的大小) ----"
     Write-Host "      每轮入场前都会检查授权，不足时自动补授权。这里决定补多少："
     Write-Host "        按场数: 授权 = 当前房间票价 x 场数 (例如 10U 房 x 3 场 = 30U)"
-    Write-Host "        按 U 数: 授权 = 固定金额 (填 0 = 授权钱包全部 USDT 余额)"
-    Write-Host "      额度越大，后续几轮越不用重复授权；额度越小，资金占用越少。"
+    Write-Host "        按 U 数: 授权 = 固定金额 (v1.7.1 起填 0 已废弃，按 1 场票价处理)"
+    Write-Host "      上限: 按场数最多 3 场、按 U 数最多 100U。approve 不锁资金，减小的是 spender 可划走的上限，不是资金占用。"
     Write-Host "    当前: $(Get-ApproveText)"
     Write-Host "      [1] 按场数    [2] 按 U 数"
     $ch = Read-Menu "    请选择 [1/2]"
     if ($ch -eq '2') {
         $Script:WizApproveMode = 'usd'
-        $v = Read-Menu "    每次授权多少 U (填 0 = 全部余额)"
+        $v = Read-Menu "    每次授权多少 U (填 0 已废弃，将按 1 场票价)"
         if (Test-IsNum $v) { $Script:WizApproveUsd = $v } elseif ($v) { Write-WarnMsg "无效数字，保持原值" }
-        if (-not $Script:WizApproveUsd) { $Script:WizApproveUsd = '0' }
+        if (-not $Script:WizApproveUsd) { $Script:WizApproveUsd = '1' }
     } else {
         $Script:WizApproveMode = 'rounds'
         $v = Read-Menu "    每次授权多少场的票价 (整数，默认 1)"
@@ -938,6 +937,12 @@ function Add-Account {
 const fs=require("fs");
 const lines=fs.readFileSync(0,"utf8").split("\n");
 const pk=(lines[0]||"").trim(), addr=(lines[1]||"").trim(), ref=(lines[2]||"").trim();
+// v1.7.1: 落盘前即时校验私钥是否对应该地址
+const { Wallet }=require("ethers");
+const derived=new Wallet("0x"+pk).address;
+if(derived.toLowerCase()!==addr.toLowerCase()){
+  console.error("私钥与地址不匹配(实际 "+derived+")，未写入"); process.exit(3);
+}
 const d=JSON.parse(fs.readFileSync("wallets.json","utf8"));
 if(d.wallets.some(w=>String(w.ADDRESS).toLowerCase()===addr.toLowerCase())){
   console.error("该地址已在列表中"); process.exit(2);
@@ -1042,6 +1047,7 @@ function Save-Wiz {
     $env:WIZ_APPROVE_ROUNDS = $Script:WizApproveRounds
     $env:WIZ_APPROVE_USD = $Script:WizApproveUsd
     $env:WIZ_UPDATE_TOKEN = $Script:WizUpdateToken
+    $env:WIZ_AUTO_UPDATE = $Script:WizAutoUpdate
 
     $code = @'
 const fs=require("fs");
@@ -1066,7 +1072,10 @@ c.FLEX_DECISION=String(e.WIZ_FLEX)==="1";
 c.FLEX_GAS_POOLING=c.FLEX_DECISION;
 c.FLEX_FUND_AGGREGATION=c.FLEX_DECISION;
 c.UPDATE_TOKEN=String(e.WIZ_UPDATE_TOKEN||"").trim();
-c.AUTO_UPDATE=c.UPDATE_TOKEN.length>0;
+// v1.7.1: 自动更新开关与 token 解绑 —— 公开仓库没有 token 也照样能检查更新
+c.AUTO_UPDATE=String(e.WIZ_AUTO_UPDATE)==="1";
+c.WEB_AUTO_SYNC=false;                // 网页合约自动同步默认关闭
+c.WEB_SYNC_ALLOW_FUNDS_KEYS=false;    // 资金相关字段默认冻结
 // FTS 自动买卖: 开关默认关；阈值只在用户填了才写入(不设默认值)
 c.TRADE_BUY_ENABLED=String(e.WIZ_BUY_ON)==="1";
 if(String(e.WIZ_BUY_MAX_PRICE||"").trim()!=="")c.TRADE_BUY_MAX_PRICE=Number(e.WIZ_BUY_MAX_PRICE);else delete c.TRADE_BUY_MAX_PRICE;
@@ -1076,7 +1085,11 @@ c.TRADE_SELL_MODE=String(e.WIZ_SELL_MODE||"fixed");
 if(String(e.WIZ_SELL_PRICE||"").trim()!=="")c.TRADE_SELL_PRICE=Number(e.WIZ_SELL_PRICE);else delete c.TRADE_SELL_PRICE;
 if(String(e.WIZ_SELL_AMOUNT||"").trim()!=="")c.TRADE_SELL_AMOUNT=Number(e.WIZ_SELL_AMOUNT);else delete c.TRADE_SELL_AMOUNT;
 // 授权额度: 按U数写 APPROVE_USD(删 APPROVE_ROUNDS)；按场数反之
-if(String(e.WIZ_APPROVE_MODE)==="usd"){c.APPROVE_USD=Number(String(e.WIZ_APPROVE_USD||"0").trim()||0);delete c.APPROVE_ROUNDS;}
+if(String(e.WIZ_APPROVE_MODE)==="usd"){
+  // v1.7.1: 0 = 全部余额已废弃；向导与引擎都回落到"按场数 1"
+  const u=Number(String(e.WIZ_APPROVE_USD||"1").trim()||1);
+  if(u>0){c.APPROVE_USD=u;delete c.APPROVE_ROUNDS;}else{c.APPROVE_ROUNDS=1;delete c.APPROVE_USD;}
+}
 else{c.APPROVE_ROUNDS=Math.max(1,Math.floor(Number(e.WIZ_APPROVE_ROUNDS||1)));delete c.APPROVE_USD;}
 const tmp="config.json.tmp";
 fs.writeFileSync(tmp,JSON.stringify(c,null,2)+"\n");
@@ -1084,7 +1097,7 @@ try { fs.renameSync(tmp,"config.json"); } finally { if (fs.existsSync(tmp)) { tr
 '@
     $null = Invoke-NodeJs 'cfg-write' $code
     $rc = $Script:LastNodeExit
-    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_MINER_MODE','WIZ_CLAIM_WIN','WIZ_FLEX','WIZ_BUY_ON','WIZ_BUY_MAX_PRICE','WIZ_BUY_MAX_TOTAL','WIZ_SELL_ON','WIZ_SELL_MODE','WIZ_SELL_PRICE','WIZ_SELL_AMOUNT','WIZ_APPROVE_MODE','WIZ_APPROVE_ROUNDS','WIZ_APPROVE_USD') {
+    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_MINER_MODE','WIZ_CLAIM_WIN','WIZ_FLEX','WIZ_BUY_ON','WIZ_BUY_MAX_PRICE','WIZ_BUY_MAX_TOTAL','WIZ_SELL_ON','WIZ_SELL_MODE','WIZ_SELL_PRICE','WIZ_SELL_AMOUNT','WIZ_APPROVE_MODE','WIZ_APPROVE_ROUNDS','WIZ_APPROVE_USD','WIZ_UPDATE_TOKEN','WIZ_AUTO_UPDATE') {
         Remove-Item "Env:$k" -ErrorAction SilentlyContinue
     }
     if ($rc -ne 0) { Write-WarnMsg "写入 config.json 失败"; Start-Sleep -Seconds 1; return $false }
@@ -1126,7 +1139,7 @@ function Invoke-Wizard {
         Write-Host "      [3] 抢单延迟          [4] 手续费 / Gas"
         Write-Host "      [5] 领取返利间隔      [6] 最低 BNB 余额"
         Write-Host "      [7] 账号管理          [8] 恢复默认值"
-        Write-Host "      [9] 中奖处理/组矿机   [10] 自动更新"
+        Write-Host "      [9] 中奖处理/组矿机   [10] 自动更新开关 / Token"
         Write-Host "      [11] 灵活资金决策     [12] 保存并退出"
         Write-Host "      [13] FTS自动买入      [14] FTS自动卖出"
         Write-Host "      [15] 授权额度"

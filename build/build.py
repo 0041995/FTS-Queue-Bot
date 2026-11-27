@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-把 src/core.js 与 src/probe.js 注入到两个模板里，生成可直接分发的单文件脚本。
+把 src/core.js、src/probe.js、src/update.js 注入两个模板，生成可直接分发的单文件脚本，
+并生成 dist/SHA256SUMS.txt（v1.7.1：本地发行版与 CI Release 附件使用同一套生成逻辑）。
 
 产物:
-    dist/autofts.sh    Linux / Termux / macOS 用，LF 换行，带执行位
-    dist/autofts.ps1   Windows 用，CRLF 换行 + UTF-8 BOM
+    dist/autofts.sh        Linux / Termux / macOS 用，LF 换行，带执行位
+    dist/autofts.ps1       Windows 用，CRLF 换行 + UTF-8 BOM
+    dist/update.sh         POSIX 一键更新器
+    dist/update.ps1        Windows 一键更新器
+    dist/update.js         更新器本体
+    dist/SHA256SUMS.txt    上述 5 个文件的 SHA-256（sha256sum 格式）
 
 为什么 ps1 必须是 CRLF + BOM:
     * 没有 BOM，PowerShell 5.1 会按系统代码页(中文机器是 GBK)解析，中文全部乱码；
@@ -15,6 +20,7 @@
     python3 build/build.py
 """
 
+import hashlib
 import os
 import sys
 
@@ -22,6 +28,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DIR = os.path.join(ROOT, "src")
 TPL_DIR = os.path.join(ROOT, "templates")
 DIST_DIR = os.path.join(ROOT, "dist")
+SCRIPT_DIR = os.path.join(ROOT, "scripts")
 
 CORE_MARK = "@@CORE_JS@@"
 PROBE_MARK = "@@PROBE_JS@@"
@@ -43,6 +50,14 @@ def check_ps_safe(name, body):
             )
 
 
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def main():
     version = read_text(os.path.join(ROOT, "VERSION")).strip()
     if not version:
@@ -50,9 +65,8 @@ def main():
     core = read_text(os.path.join(SRC_DIR, "core.js"))
     probe = read_text(os.path.join(SRC_DIR, "probe.js"))
     updater = read_text(os.path.join(SRC_DIR, "update.js"))
-    check_ps_safe("src/core.js", core)
-    check_ps_safe("src/probe.js", probe)
-    check_ps_safe("src/update.js", updater)
+    for name, body in (("src/core.js", core), ("src/probe.js", probe), ("src/update.js", updater)):
+        check_ps_safe(name, body)
     # 模板里占位符独占一行，源码结尾的换行要先去掉，否则会多出一个空行
     core_inject = core.rstrip("\n")
     probe_inject = probe.rstrip("\n")
@@ -87,7 +101,7 @@ def main():
         f.write(ps)
 
     # ---- 一键更新附属文件 ----
-    update_sh_src = read_text(os.path.join(ROOT, "scripts", "update.sh"))
+    update_sh_src = read_text(os.path.join(SCRIPT_DIR, "update.sh"))
     update_sh_path = os.path.join(DIST_DIR, "update.sh")
     with open(update_sh_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(update_sh_src)
@@ -96,7 +110,7 @@ def main():
     except OSError:
         pass
 
-    update_ps_src = read_text(os.path.join(ROOT, "scripts", "update.ps1"))
+    update_ps_src = read_text(os.path.join(SCRIPT_DIR, "update.ps1"))
     update_ps_path = os.path.join(DIST_DIR, "update.ps1")
     with open(update_ps_path, "w", encoding="utf-8-sig", newline="") as f:
         f.write(update_ps_src.replace("\r\n", "\n").replace("\n", "\r\n"))
@@ -105,14 +119,28 @@ def main():
     with open(updater_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(updater)
 
-    for path in (sh_path, ps_path):
+    # ---- 占位符必须全部替换干净（含附属文件）----
+    for path in (sh_path, ps_path, update_sh_path, update_ps_path, updater_path):
         with open(path, encoding="utf-8-sig") as f:
             if "@@" in f.read():
                 sys.exit("错误: %s 里还有没替换的占位符" % os.path.basename(path))
 
-    for p in (sh_path, ps_path, update_sh_path, update_ps_path, updater_path):
-        size = os.path.getsize(p)
-        print("已生成 %-24s %8.1f KB" % (os.path.relpath(p, ROOT), size / 1024.0))
+    # ---- v1.7.1: 统一生成 SHA256SUMS.txt ----
+    summed = ["autofts.sh", "autofts.ps1", "update.sh", "update.ps1", "update.js"]
+    sums_path = os.path.join(DIST_DIR, "SHA256SUMS.txt")
+    lines = []
+    for name in summed:
+        lines.append("%s  %s" % (sha256_file(os.path.join(DIST_DIR, name)), name))
+    with open(sums_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+
+    print("FTS-Queue-Bot v%s 发行版构建完成：" % version)
+    for name in summed:
+        path = os.path.join(DIST_DIR, name)
+        print("  %-24s %9d B" % (name, os.path.getsize(path)))
+    print("  SHA256SUMS.txt            %9d B" % os.path.getsize(sums_path))
+    for line in lines:
+        print("  " + line)
 
 
 if __name__ == "__main__":

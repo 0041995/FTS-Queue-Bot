@@ -1,6 +1,6 @@
 'use strict';
 /**
- * FTS 多账号自动打金 - 加固版核心引擎 v2.0
+ * FTS 多账号自动打金 - 加固版核心引擎（版本与发行包 VERSION 一致）
  * 模式: run(默认) | dry-run(只预演不上链) | selftest(只读体检, 不发任何交易)
  */
 
@@ -30,9 +30,10 @@ const { execFile } = require('child_process');
 const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
-const VERSION = '2.2-v8';
-// 包版本(1.3.x)由外壳脚本通过 FTS_APP_VERSION 注入；引擎版本 VERSION 只用于日志
-const APP_VERSION = process.env.FTS_APP_VERSION || '0.0.0';
+// v1.7.1: 引擎日志版本与发行包版本统一，不再出现两套互不相同的版本号。
+// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.7.1。
+const APP_VERSION = process.env.FTS_APP_VERSION || '1.7.1';
+const VERSION = APP_VERSION;
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
   ? 'powershell -ExecutionPolicy Bypass -File autofts.ps1'
@@ -165,13 +166,15 @@ const CFG = {
   // 交易类型: auto=运行时探测链是否支持 EIP-1559 / 0=强制 Legacy / 2=强制 1559
   TX_TYPE: String(process.env.FTS_TX_TYPE || userCfg.TX_TYPE || 'auto').toLowerCase(),
   PRIORITY_MAX_GWEI: cfgNum(process.env.FTS_PRIORITY_GWEI ?? userCfg.PRIORITY_MAX_GWEI, 1.5, 'PRIORITY_MAX_GWEI'),
-  // 授权额度: 默认按"票价 × 轮数"算小额授权，避免大额无限授权
-  // 授权策略: 默认每轮只授权"刚好一轮票价"，用完再授权（避免大额/多轮授权带来的问题）
-  // 仅在显式设置 FTS_APPROVE_ROUNDS>1 或 FTS_APPROVE_USD 时才改变
+  // v1.7.1 授权上限: 绝不再把"填 0"解释成"授权钱包全部 USDT 余额"。
+  // 按场数最多 APPROVE_MAX_ROUNDS 场，按 U 数最多 APPROVE_MAX_USD U，两者取更严的一个。
+  // USDT approve 不锁资金，减小额度只是减小 spender 可划走的上限，不是"资金占用"。
   APPROVE_USD: process.env.FTS_APPROVE_USD !== undefined || userCfg.APPROVE_USD !== undefined
     ? cfgNum(process.env.FTS_APPROVE_USD ?? userCfg.APPROVE_USD, 0, 'APPROVE_USD')
     : null,                                   // null = 自动按票价 × APPROVE_ROUNDS
   APPROVE_ROUNDS: cfgNum(process.env.FTS_APPROVE_ROUNDS ?? userCfg.APPROVE_ROUNDS, 1, 'APPROVE_ROUNDS'),
+  APPROVE_MAX_ROUNDS: cfgNum(process.env.FTS_APPROVE_MAX_ROUNDS ?? userCfg.APPROVE_MAX_ROUNDS, 3, 'APPROVE_MAX_ROUNDS'),
+  APPROVE_MAX_USD: cfgNum(process.env.FTS_APPROVE_MAX_USD ?? userCfg.APPROVE_MAX_USD, 100, 'APPROVE_MAX_USD'),
   // 中奖后是否自动领取矿机额度(claimWin)。中奖与否由 Chainlink VRF 随机决定，脚本无法干预。
   CLAIM_WIN: (() => {
     const raw = process.env.FTS_CLAIM_WIN ?? userCfg.CLAIM_WIN;
@@ -198,11 +201,14 @@ const CFG = {
   })(),
   MINING_CLAIM_MS: cfgNum(process.env.FTS_MINING_CLAIM_MS ?? userCfg.MINING_CLAIM_MS, 45000, 'MINING_CLAIM_MS'),
   // ---- 运行期自动更新 ----
-  // 不在启动时查；每 UPDATE_CHECK_MS 查一次，且只在"空闲窗口"替换+重启
+  // v1.7.1: 启动即检测一次，之后每 UPDATE_CHECK_MS 查一次；只在"空闲窗口"替换+重启。
+  // 超过 UPDATE_MAX_DEFER_MS 仍等不到空闲窗口时，只提示用户手动更新，绝不强制打断抢单。
   UPDATE_CHECK_MS: cfgNum(process.env.FTS_UPDATE_CHECK_MS ?? userCfg.UPDATE_CHECK_MS, 1200000, 'UPDATE_CHECK_MS'),
   UPDATE_IDLE_MARGIN: cfgNum(process.env.FTS_UPDATE_IDLE_MARGIN ?? userCfg.UPDATE_IDLE_MARGIN, 15, 'UPDATE_IDLE_MARGIN'),
-  // 如果有新版但一直等不到空闲窗口(连续抢单)，最多推迟这么久就强制更新一次
+  // 推迟上限只用于告警，不再作为"跳过忙碌判断"的理由
   UPDATE_MAX_DEFER_MS: cfgNum(process.env.FTS_UPDATE_MAX_DEFER_MS ?? userCfg.UPDATE_MAX_DEFER_MS, 7200000, 'UPDATE_MAX_DEFER_MS'),
+  // 发现新版后重试"空闲窗口"的间隔；限流时由 update.js 退避，避免每 10 秒打一次 API
+  UPDATE_RETRY_MS: cfgNum(process.env.FTS_UPDATE_RETRY_MS ?? userCfg.UPDATE_RETRY_MS, 60000, 'UPDATE_RETRY_MS'),
   MIN_BNB_GAS: cfgNum(process.env.FTS_MIN_BNB ?? userCfg.MIN_BNB_GAS, 0.005, 'MIN_BNB_GAS'),
   // nonce 断档自愈: 发现"有在途交易但 latest 长期不动"就补一笔自转填坑
   GAP_CHECK_MS: cfgNum(process.env.FTS_GAP_CHECK_MS, 20000, 'GAP_CHECK_MS'),
@@ -236,11 +242,16 @@ const CFG = {
   // 游戏网址: 用于从网页自动探测最新合约地址(网页换合约时无需改代码)
   GAME_URL: cfgStr(process.env.FTS_GAME_URL ?? userCfg.GAME_URL, 'https://fatris.fans/dapp/game', 'GAME_URL'),
   MARKET_URL: cfgStr(process.env.FTS_MARKET_URL ?? userCfg.MARKET_URL, 'https://fatris.fans/dapp/market', 'MARKET_URL'),
-  // 启动时自动同步网页合约(默认开)。关掉则只用 config.json 里的固定地址。
+  // v1.7.1: 网页合约自动同步默认关闭。上游页面被污染时曾可把任意地址写回 config.json
+  // 并被当成 USDT approve 的 spender，因此改为"默认只用 config.json 里的固定地址"。
   WEB_AUTO_SYNC: (() => {
     const raw = process.env.FTS_WEB_SYNC ?? userCfg.WEB_AUTO_SYNC;
-    if (raw === undefined || raw === null || raw === '') return true;
-    return !(raw === false || raw === 0 || raw === '0' || raw === 'false' || raw === 'off');
+    return raw === true || raw === 1 || raw === '1' || raw === 'true' || raw === 'on';
+  })(),
+  // 资金相关字段(授权 spender / USDT / 老队列 / 市场)默认禁止网页写回；需用户显式打开。
+  WEB_SYNC_ALLOW_FUNDS_KEYS: (() => {
+    const raw = process.env.FTS_WEB_SYNC_ALLOW_FUNDS ?? userCfg.WEB_SYNC_ALLOW_FUNDS_KEYS;
+    return raw === true || raw === 1 || raw === '1' || raw === 'true' || raw === 'on';
   })(),
   // 启动排水: 等上一轮未确认交易落地，避免重启后 nonce 回退
   STARTUP_DRAIN_MS: cfgNum(process.env.FTS_DRAIN_MS, 30000, 'STARTUP_DRAIN_MS'),
@@ -263,6 +274,11 @@ const CFG = {
   TRADE_SELL_MODE: String(process.env.FTS_SELL_MODE ?? userCfg.TRADE_SELL_MODE ?? 'fixed').toLowerCase(),
   TRADE_SELL_PRICE: (() => { const v = process.env.FTS_SELL_PRICE ?? userCfg.TRADE_SELL_PRICE; const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; })(),
   TRADE_SELL_AMOUNT: (() => { const v = process.env.FTS_SELL_AMOUNT ?? userCfg.TRADE_SELL_AMOUNT; const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null; })(),
+  // v1.7.1: 卖单不再无限制重复挂单 —— 已有活跃挂单不重复挂、两次挂单有冷却、累计有上限。
+  TRADE_SELL_COOLDOWN_MS: cfgNum(process.env.FTS_SELL_COOLDOWN_MS ?? userCfg.TRADE_SELL_COOLDOWN_MS, 300000, 'TRADE_SELL_COOLDOWN_MS'),
+  TRADE_SELL_MAX_ORDERS: cfgNum(process.env.FTS_SELL_MAX_ORDERS ?? userCfg.TRADE_SELL_MAX_ORDERS, 1, 'TRADE_SELL_MAX_ORDERS'),
+  // 买单每日累计花费落盘，重启不再清零（"今日已花费"日志才与事实相符）
+  TRADE_STATE_FILE: cfgStr(process.env.FTS_TRADE_STATE_FILE ?? userCfg.TRADE_STATE_FILE, 'trade-state.json', 'TRADE_STATE_FILE'),
   // 市场合约地址(留空则从网页 VITE_MARKET_ESCROW 自动探测)
   MARKET_ADDR: cfgStr(process.env.FTS_MARKET_ADDR ?? userCfg.MARKET_ADDR, '', 'MARKET_ADDR'),
   // ---- 灵活资金决策(多账号互相匀 gas / 凑 USDT) ----
@@ -333,6 +349,17 @@ function validateCfg() {
   }
   if (!['auto', '0', '2'].includes(CFG.TX_TYPE)) { p.push(`TX_TYPE 只能是 auto/0/2，当前 "${CFG.TX_TYPE}"，已改为 auto`); CFG.TX_TYPE = 'auto'; }
   if (CFG.APPROVE_ROUNDS < 1) { p.push('APPROVE_ROUNDS 必须 >=1，已改为 1'); CFG.APPROVE_ROUNDS = 1; }
+  // v1.7.1 授权上限: 缺字段时静默补默认值(CFG 构造已有兜底)，只有显式配错才提示。
+  // 老配置升级、以及只注入部分字段的单测桩都不会被无意义告警刷屏。
+  if (CFG.APPROVE_MAX_ROUNDS === undefined) CFG.APPROVE_MAX_ROUNDS = 3;
+  else if (!Number.isFinite(CFG.APPROVE_MAX_ROUNDS) || CFG.APPROVE_MAX_ROUNDS < 1) {
+    p.push('APPROVE_MAX_ROUNDS 无效，已改为 3'); CFG.APPROVE_MAX_ROUNDS = 3;
+  }
+  CFG.APPROVE_MAX_ROUNDS = Math.min(20, Math.floor(CFG.APPROVE_MAX_ROUNDS));
+  if (CFG.APPROVE_MAX_USD === undefined) CFG.APPROVE_MAX_USD = 100;
+  else if (!Number.isFinite(CFG.APPROVE_MAX_USD) || CFG.APPROVE_MAX_USD <= 0 || CFG.APPROVE_MAX_USD >= 1e21) {
+    p.push('APPROVE_MAX_USD 无效，已改为 100'); CFG.APPROVE_MAX_USD = 100;
+  }
   // cfgNum 只校验"是不是有限数字"，1.5 能过关，但后面 BigInt(1.5) 会抛 RangeError，
   // 结果是这个账号每次要授权时都炸在这里，且日志被节流后基本看不到
   if (!Number.isInteger(CFG.APPROVE_ROUNDS)) {
@@ -366,6 +393,18 @@ function validateCfg() {
   if (CFG.UPDATE_CHECK_MS < 60000) { p.push('UPDATE_CHECK_MS 太小，已改为 60000'); CFG.UPDATE_CHECK_MS = 60000; }
   if (CFG.UPDATE_IDLE_MARGIN < 0) { p.push('UPDATE_IDLE_MARGIN 不能为负，已改为 15'); CFG.UPDATE_IDLE_MARGIN = 15; }
   if (CFG.UPDATE_MAX_DEFER_MS < 600000) { p.push('UPDATE_MAX_DEFER_MS 太小，已改为 600000'); CFG.UPDATE_MAX_DEFER_MS = 600000; }
+  if (CFG.UPDATE_RETRY_MS === undefined) CFG.UPDATE_RETRY_MS = 60000;
+  else if (!Number.isFinite(CFG.UPDATE_RETRY_MS) || CFG.UPDATE_RETRY_MS < 10000) {
+    p.push('UPDATE_RETRY_MS 太小(会刷 GitHub API)，已改为 60000'); CFG.UPDATE_RETRY_MS = 60000;
+  }
+  if (CFG.TRADE_SELL_COOLDOWN_MS === undefined) CFG.TRADE_SELL_COOLDOWN_MS = 300000;
+  else if (!Number.isFinite(CFG.TRADE_SELL_COOLDOWN_MS) || CFG.TRADE_SELL_COOLDOWN_MS < 1000) {
+    p.push('TRADE_SELL_COOLDOWN_MS 无效，已改为 300000'); CFG.TRADE_SELL_COOLDOWN_MS = 300000;
+  }
+  if (CFG.TRADE_SELL_MAX_ORDERS === undefined) CFG.TRADE_SELL_MAX_ORDERS = 1;
+  else if (!Number.isInteger(CFG.TRADE_SELL_MAX_ORDERS) || CFG.TRADE_SELL_MAX_ORDERS < 1) {
+    p.push('TRADE_SELL_MAX_ORDERS 必须 >=1，已改为 1'); CFG.TRADE_SELL_MAX_ORDERS = 1;
+  }
   // 并发闸门: 默认 8(实测稳定最优点)。硬上限 16=延迟恶化拐点，超过只能是自找 429/高延迟。
   if (!Number.isInteger(CFG.RPC_MAX_CONCURRENT) || CFG.RPC_MAX_CONCURRENT < 1 || CFG.RPC_MAX_CONCURRENT > 16) {
     const fixed = Number.isFinite(CFG.RPC_MAX_CONCURRENT)
@@ -1187,6 +1226,42 @@ async function tryFlexTopUp(inst, needUsdtWei, needGasWei) {
   }
 }
 
+// v1.7.1: 授权额度计算（纯函数，便于回归测试）。
+// 返回 { target: BigInt, note: string }；余额不足一轮票价时返回 null，避免发起无意义授权。
+// 硬规则: 0 不再等于"全部余额"；额度同时受场数上限与 U 数上限约束；绝不 MaxUint256。
+function computeApproveTarget(ticketPrice, bal, cfg, parseUnits) {
+  const note = [];
+  const maxRounds = Math.min(20, Math.max(1, Math.floor(Number(cfg.APPROVE_MAX_ROUNDS) || 3)));
+  const maxUsdRaw = Number(cfg.APPROVE_MAX_USD);
+  const maxUsd = Number.isFinite(maxUsdRaw) && maxUsdRaw > 0 && maxUsdRaw < 1e21 ? maxUsdRaw : 100;
+  const capByUsd = parseUnits(String(maxUsd), 18);
+  const capByRounds = ticketPrice * BigInt(maxRounds);
+  // 按模式分别设上限：按场数最多 maxRounds 场，按 U 数最多 maxUsd U。
+  let target, cap;
+  if (cfg.APPROVE_USD === null || cfg.APPROVE_USD === undefined) {
+    cap = capByRounds;
+    const want = Math.max(1, Math.floor(Number(cfg.APPROVE_ROUNDS) || 1));
+    const rounds = Math.min(maxRounds, want);
+    if (rounds !== want) note.push(`授权场数已收敛到上限 ${maxRounds} 场`);
+    target = ticketPrice * BigInt(rounds);
+  } else if (Number(cfg.APPROVE_USD) === 0) {
+    // v1.7.0 把 0 解释成"全部余额"，与项目自己的安全承诺冲突；1.7.1 起一律回落到一轮票价。
+    cap = ticketPrice;
+    note.push('APPROVE_USD=0（全部余额）已废弃，按 1 场票价授权');
+    target = ticketPrice;
+  } else {
+    cap = capByUsd;
+    try { target = parseUnits(String(cfg.APPROVE_USD), 18); }
+    catch (e) { note.push('APPROVE_USD 解析失败，按 1 场票价授权'); target = ticketPrice; }
+  }
+  if (!(target > 0n)) { target = ticketPrice; }
+  if (target > cap) { note.push(`授权额已压到上限 ${maxUsd}U / ${maxRounds} 场`); target = cap; }
+  if (bal < ticketPrice) return null;          // 余额不够入场：不发注定无意义的 approve
+  if (target > bal) target = bal;
+  if (!(target > 0n)) return null;
+  return { target, note: note.join('；') };
+}
+
 async function ensureFunds(inst, ticketPrice, room) {
   const tag = roomLabel(room, ticketPrice);
   // 1) USDT 余额
@@ -1242,28 +1317,22 @@ async function ensureFunds(inst, ticketPrice, room) {
   const need = ticketPrice;
   if (allowance >= need) return true;
 
-  // 默认: 授权额度 = 本轮票价。可用 FTS_APPROVE_ROUNDS>1 或 FTS_APPROVE_USD 覆盖
-  let target;
+  // v1.7.1: 统一走 computeApproveTarget —— 拒绝"全部余额"、压上限、余额不足不空发 approve
+  let plan;
   try {
-    if (CFG.APPROVE_USD === null) {
-      // Math.floor 是给 validateCfg 漏网时的兜底: BigInt(1.5) 会抛 RangeError
-      target = ticketPrice * BigInt(Math.max(1, Math.floor(CFG.APPROVE_ROUNDS)));
-    } else if (CFG.APPROVE_USD === 0) {
-      target = bal;
-    } else {
-      target = ethers.parseUnits(String(CFG.APPROVE_USD), 18);
-    }
+    plan = computeApproveTarget(ticketPrice, bal, CFG, ethers.parseUnits);
   } catch (e) {
-    // 配置写坏时绝不能让异常冒到抢单流程外面: 那样这个账号每轮都在这里炸，
-    // 而日志被 errOnce 节流后几乎看不见，表现就是"授权永远失败但不知道为什么"
-    err(inst.address, `[${tag}] 计算授权额度失败，已按一轮票价兜底(检查 APPROVE_USD / APPROVE_ROUNDS): ${formatError(e)}`);
-    target = ticketPrice;
+    err(inst.address, `[${tag}] 计算授权额度失败，本轮放弃入场: ${formatError(e)}`);
+    return false;
   }
-  // 负数 / 0 一律退回一轮票价: approve 不接受负值，0 授权等于白发一笔交易
-  if (!(target > 0n)) target = ticketPrice;
-  if (bal < target) target = bal; // 余额不足则按余额授权
+  if (!plan) {
+    warnOnce(inst.address, `[${tag}] USDT 余额 ${ethers.formatUnits(bal, 18)} < 本轮票价 ${ethers.formatUnits(need, 18)}，不发起无意义授权，跳过本轮`, 60000);
+    return false;
+  }
+  const target = plan.target;
+  if (plan.note) warnOnce(inst.address, `[${tag}] ${plan.note}`, 300000);
   const rounds = Number(ethers.formatUnits(target, 18)) / Number(ethers.formatUnits(ticketPrice, 18));
-  info(inst.address, `[${tag}] 授权不足(当前 ${ethers.formatUnits(allowance, 18)} < 本轮需要 ${ethers.formatUnits(need, 18)})，发起授权 ${ethers.formatUnits(target, 18)} USDT (${rounds >= 1 ? Math.round(rounds) : rounds.toFixed(2)} 轮用量)`);
+  info(inst.address, `[${tag}] 授权不足(当前 ${ethers.formatUnits(allowance, 18)} < 本轮需要 ${ethers.formatUnits(need, 18)})，发起授权 ${ethers.formatUnits(target, 18)} USDT (${rounds >= 1 ? Math.round(rounds) : rounds.toFixed(2)} 轮用量，上限 ${CFG.APPROVE_MAX_USD}U / ${CFG.APPROVE_MAX_ROUNDS} 场)`);
   const okTx = await sendTx(inst, {
     label: `[${tag}] USDT 授权 ${ethers.formatUnits(target, 18)}`,
     contract: inst.usdt,
@@ -2098,9 +2167,10 @@ async function miningClaimLoop(inst) {
 }
 
 // ---------------- 运行期自动更新(空闲窗口) ----------------
-// 不在启动时检查。每 UPDATE_CHECK_MS 查一次；发现新版先记下来，
+// v1.7.1: 启动即检测一次，之后每 UPDATE_CHECK_MS 查一次；发现新版先记下来，
 // 等到"没有轮次接近满员 / 没有交易在途 / 没有结算中"的空闲窗口，
 // 才替换脚本并 exit 90，由外壳脚本原地重启。
+// 超过 UPDATE_MAX_DEFER_MS 仍等不到空闲窗口时只告警，绝不强制打断抢单。
 let updatePendingTag = null;
 let updatePendingSince = 0;
 let updateBusy = false;
@@ -2120,18 +2190,24 @@ function isBusyForRestart() {
   if (instances.some(i => (i.inflight || 0) > 0 || i.busy || (i.unconfirmed || 0) > 0)) return true;
   const rooms = sharedCache.rooms;
   if (!rooms) return true;                       // 状态还没读到，保守不重启
-  const need = Math.max(5, CFG.SNIPE_MIN_COUNT - CFG.UPDATE_IDLE_MARGIN);
+  // v1.7.1: 抢位窗口内也视为忙(人数已进入可入场区间)，结算/开轮中同样不重启
+  const need = Math.max(1, CFG.SNIPE_MIN_COUNT - CFG.UPDATE_IDLE_MARGIN);
   for (const k of Object.keys(rooms)) {
     const st = rooms[k];
     if (!st.enabled) continue;
-    if (st.state === 0 && st.count >= need) return true;           // 快满员，随时要抢
+    if (st.state !== 0) return true;                                // 结算/开轮中
+    if (st.count >= need) return true;                              // 快满员或已在抢位区间
   }
   return false;
 }
 
 async function tryApplyUpdate(asset, force) {
-  if (!force && isBusyForRestart()) {
-    warnOnce('SYS', `有新版本 v${updatePendingTag}，当前正在抢单/有交易在途，暂缓更新`, 300000);
+  // v1.7.1: 无论是否超时都先问 isBusyForRestart —— 旧版 force=true 会跳过忙碌判断，
+  // 在"正在抢单/有交易在途"时强制替换并 exit 90，与"不会打断抢单"的承诺冲突。
+  if (isBusyForRestart()) {
+    warnOnce('SYS', force
+      ? `新版 v${updatePendingTag} 已推迟超过 ${Math.round(CFG.UPDATE_MAX_DEFER_MS / 3600000)} 小时仍等不到空闲窗口；不会强制打断抢单，可择机手动执行 --update`
+      : `有新版本 v${updatePendingTag}，当前正在抢单/有交易在途，暂缓更新`, 300000);
     return false;
   }
   info('SYS', `进入空闲窗口，开始更新到 v${updatePendingTag} ...`);
@@ -2154,8 +2230,8 @@ async function updateLoop() {
     try {
       if (updatePendingTag) {
         const force = updatePendingSince && Date.now() - updatePendingSince > CFG.UPDATE_MAX_DEFER_MS;
-        await tryApplyUpdate(asset, force);       // 忙就返回 false，10 秒后再看
-        await sleep(10000);
+        await tryApplyUpdate(asset, force);       // 忙就返回 false，按 UPDATE_RETRY_MS 再看
+        await sleep(CFG.UPDATE_RETRY_MS);
         continue;
       }
       if (!updateBusy) {
@@ -2166,8 +2242,13 @@ async function updateLoop() {
           updatePendingTag = RegExp.$1;
           updatePendingSince = Date.now();
           info('SYS', `发现新版本 v${updatePendingTag}，将等空闲窗口自动更新(不打断抢单)`);
-        } else if (/SKIP_AUTH|SKIP_PRIVATE/.test(out)) {
-          warnOnce('SYS', '自动更新跳过: 需要 GitHub 只读 token（--init 的 [10] 自动更新）', 3600000);
+        } else if (/SKIP_RATE_LIMIT/.test(out)) {
+          // 公开仓库未认证请求也会撞 403，提示"需要 token"是误导；这里明确是限流并已退避
+          warnOnce('SYS', '自动更新检查遇到 GitHub API 限流，已自动退避；公开仓库无需 token', 3600000);
+        } else if (/SKIP_AUTH/.test(out)) {
+          warnOnce('SYS', '自动更新跳过: 该仓库需要 GitHub 只读 token（仅私有仓库需要）', 3600000);
+        } else if (/SKIP_PRIVATE/.test(out)) {
+          warnOnce('SYS', '自动更新跳过: 仓库不存在或无权访问', 3600000);
         }
       }
     } catch (e) {
@@ -2441,18 +2522,22 @@ function getWalletPassword() {
 // 这个映射会变。直接抓页面 -> 提取 JS 地址 -> 解析映射 -> 写回 config.json，
 // 无需改代码。所有地址都做链上代码存在性校验，避免抓到假地址。
 // 脚本真正用到的合约字段 <- 网页 VITE 键名。一个字段可对应多个候选键(按顺序取第一个命中)。
+// v1.7.1: 只保留引擎真正会读的字段。FTS_ADDR / PAIR_ADDR 在 v1.7.0 里只是往 config.json
+// 多写两个永远没人读的死键(现货价实际来自 market.fts()/market.pair())，已移除。
 const WEB_CONTRACT_MAP = {
   QUEUE_ADDR: ['VITE_P2_QUEUE'],
   MINER_QUEUE_ADDR: ['VITE_P2_LEGACY_QUEUE', 'VITE_P2_LEGACY_QUEUE_V7'],
   MINING_VAULT_ADDR: ['VITE_P2_MINING'],
   LEGACY_MINING_ADDR: ['VITE_P2_LEGACY_MINING'],
   USDT_ADDR: ['VITE_P2_USDT', 'VITE_USDT_ADDRESS'],
-  FTS_ADDR: ['VITE_P2_TOKEN', 'VITE_TOKEN_ADDRESS'],
-  MARKET_ADDR: ['VITE_MARKET_ESCROW'],
-  PAIR_ADDR: ['VITE_P2_PAIR']
+  MARKET_ADDR: ['VITE_MARKET_ESCROW']
 };
+// 资金相关字段: USDT approve 的 spender、USDT 合约、老队列、市场合约都直接触达资金。
+// 默认禁止网页自动写回；必须 VITE 映射命中 + 链上校验通过 + 用户显式允许三者同时成立。
+const WEB_FUNDS_KEYS = ['QUEUE_ADDR', 'USDT_ADDR', 'MINER_QUEUE_ADDR', 'MARKET_ADDR'];
 // ABI 特征 -> 合约字段。VITE 映射缺失/改名时的兜底识别：
 // 地址附近(上下文窗口)出现这组函数名，就认定是该类合约。
+// v1.7.1: 兜底只用于"提示"，绝不用于写回资金相关字段（见 filterSyncCandidates）。
 const ABI_FINGERPRINTS = [
   { field: 'QUEUE_ADDR', need: ['enterQueue', 'roomConfigs'] },
   { field: 'MARKET_ADDR', need: ['nextOrderId', 'fillOrder'] },
@@ -2634,27 +2719,54 @@ async function probeWebContracts(gameUrl, marketUrl, deep) {
   return { found, all, jsUrls: [...jsSeen], pagesScanned: pagesSeen.size, viaAbi };
 }
 // 在 JS 文本里找"上下文含指定函数名"的地址
+// v1.7.1: 6000 字符窗口几乎必然命中特征函数名，返回的只是"文本顺序上第一个地址"。
+// 收紧到 600 字符，并要求候选唯一；多个候选一律返回 null（宁可不认，不可认错）。
 function findAddressByFingerprint(js, needFns) {
   const addrRe = /0x[a-fA-F0-9]{40}/g;
+  const hits = [];
   let m;
   while ((m = addrRe.exec(js))) {
     const addr = m[0];
     if (/^0x0{40}$/.test(addr)) continue;
-    const ctx = js.slice(Math.max(0, m.index - 3000), m.index + 3000);
-    if (needFns.every(fn => ctx.includes(fn))) return addr;
+    const ctx = js.slice(Math.max(0, m.index - 600), m.index + 600);
+    if (needFns.every(fn => ctx.includes(fn))) hits.push(addr.toLowerCase());
   }
-  return null;
+  const uniq = [...new Set(hits)];
+  return uniq.length === 1 ? uniq[0] : null;
 }
-// 校验地址在链上有代码；返回 {addr:bool}
+// 校验地址在链上有代码；返回 {key:bool}。
+// v1.7.1: 每个 key 都显式写入结果；RPC 失败一律 false（调用方据此拒绝全部写回）。
 async function validateContractAddresses(addrs) {
   const out = {};
   await Promise.all(Object.entries(addrs).map(async ([k, a]) => {
+    if (!/^0x[a-fA-F0-9]{40}$/.test(a)) { out[k] = false; return; }
     try {
       const code = await mgr.rpc(p => p.getCode(a));
       out[k] = !!(code && code !== '0x');
     } catch (e) { out[k] = false; }
   }));
   return out;
+}
+
+// v1.7.1: 决定哪些网页地址允许写回 config.json（纯函数，可回归测试）。
+// 原则: 校验必须显式通过；RPC 不可用(valid 为空)一个都不写；ABI 启发式不碰资金字段；
+// 资金字段默认冻结，只有显式配置 WEB_SYNC_ALLOW_FUNDS_KEYS 才放行。
+function filterSyncCandidates(found, valid, viaAbi, cfg) {
+  const accepted = {}, rejected = {};
+  const allowFunds = !!(cfg && cfg.WEB_SYNC_ALLOW_FUNDS_KEYS);
+  const v = valid || {}, abi = viaAbi || {};
+  for (const [k, addr] of Object.entries(found || {})) {
+    if (!Object.prototype.hasOwnProperty.call(WEB_CONTRACT_MAP, k)) {
+      rejected[k] = '非白名单字段'; continue;
+    }
+    if (v[k] !== true) { rejected[k] = '链上校验未通过或 RPC 不可用'; continue; }
+    if (abi[k]) { rejected[k] = 'ABI 启发式结果不写回'; continue; }
+    if (WEB_FUNDS_KEYS.includes(k) && !allowFunds) {
+      rejected[k] = '资金相关字段默认冻结(WEB_SYNC_ALLOW_FUNDS_KEYS=false)'; continue;
+    }
+    accepted[k] = addr;
+  }
+  return { accepted, rejected };
 }
 // 把探测到的地址写回 config.json（保留其它配置，只改合约字段）
 function saveWebContracts(found) {
@@ -2666,6 +2778,7 @@ function saveWebContracts(found) {
   } catch (e) { /* 新文件 */ }
   let changed = 0;
   for (const [k, v] of Object.entries(found)) {
+    if (!Object.prototype.hasOwnProperty.call(WEB_CONTRACT_MAP, k)) continue;  // v1.7.1: 不写未知键
     if (/^0x[a-fA-F0-9]{40}$/.test(v) && cfg[k] !== v) { cfg[k] = v; changed++; }
   }
   if (changed) {
@@ -2687,19 +2800,20 @@ async function syncWebContracts(apply, deep) {
   if (r.viaAbi && Object.keys(r.viaAbi).length) {
     info('SYS', `其中 ${Object.keys(r.viaAbi).join(', ')} 由 ABI 特征识别(VITE 映射缺失)`);
   }
-  // 链上校验(用 mgr.provider; 若尚未 pickBest 则临时建一个)
+  // v1.7.1: RPC 不可用 / 校验失败时一个地址都不写回（旧版 valid={} 会让所有地址无条件通过）。
   if (!mgr.provider) {
-    try { await mgr.pickBest(); } catch (e) { warn('SYS', '链上校验跳过(RPC 不可用): ' + formatError(e).slice(0, 100)); }
+    try { await mgr.pickBest(); } catch (e) { warn('SYS', 'RPC 不可用，本次不写回任何合约地址: ' + formatError(e).slice(0, 100)); }
   }
   const valid = mgr.provider ? await validateContractAddresses(r.found) : {};
-  const accepted = {};
-  for (const k of keys) {
-    const okCode = valid[k] !== false;   // 校验失败不阻挡(可能因临时节点问题)
-    if (okCode) accepted[k] = r.found[k];
-    else warn('SYS', `${k}=${r.found[k]} 链上无代码，已忽略`);
+  const { accepted, rejected } = filterSyncCandidates(r.found, valid, r.viaAbi, CFG);
+  for (const [k, why] of Object.entries(rejected)) {
+    warn('SYS', `${k}=${r.found[k]} 未写回: ${why}`);
+  }
+  if (!Object.keys(accepted).length) {
+    warn('SYS', '没有任何合约地址通过校验，config.json 保持不变（不会因网页污染改授权对象）');
   }
   const changed = apply ? saveWebContracts(accepted) : 0;
-  return { found: r.found, accepted, all: r.all, jsUrls: r.jsUrls, pagesScanned: r.pagesScanned, viaAbi: r.viaAbi, changed };
+  return { found: r.found, accepted, rejected, all: r.all, jsUrls: r.jsUrls, pagesScanned: r.pagesScanned, viaAbi: r.viaAbi, changed };
 }
 
 // ---------------- FTS 自动买卖 ----------------
@@ -2719,6 +2833,18 @@ const PAIR_ABI = [
   'function token0() view returns (address)',
   'function token1() view returns (address)'
 ];
+// v1.7.1: token0 既不是 FTS 也不是 USDT 时必须拒绝，不能默默用错储备算出错误价格去挂单。
+function computeFtsSpotPrice(r0, r1, token0, ftsAddr, usdtAddr, formatUnits) {
+  const a = String(token0).toLowerCase();
+  const fts = String(ftsAddr).toLowerCase(), usdt = String(usdtAddr).toLowerCase();
+  if (a !== fts && a !== usdt) return null;
+  const v0 = Number(formatUnits(r0, 18)), v1 = Number(formatUnits(r1, 18));
+  if (!(v0 > 0) || !(v1 > 0)) return null;
+  const vFts = a === fts ? v0 : v1;
+  const vUsdt = a === usdt ? v0 : v1;
+  if (!(vFts > 0) || !(vUsdt > 0)) return null;
+  return vUsdt / vFts;
+}
 // 读 FTS 真实价格: 从 DEX pair 储备算 USDT/FTS，不读市场挂单价(用户要求)
 async function getFtsSpotPrice(market) {
   const pairAddr = await mgr.rpc(p => market.pair());
@@ -2732,13 +2858,8 @@ async function getFtsSpotPrice(market) {
   const r0 = BigInt(res.reserve0 || res[0]);
   const r1 = BigInt(res.reserve1 || res[1]);
   if (r0 <= 0n || r1 <= 0n) return null;
-  const lower = String(t0).toLowerCase();
-  // 判断哪个储备是 FTS、哪个是 USDT
-  const rFts = lower === String(ftsAddr).toLowerCase() ? r0 : r1;
-  const rUsdt = lower === String(usdtAddr).toLowerCase() ? r0 : r1;
-  if (rFts <= 0n || rUsdt <= 0n) return null;
-  // USDT(18位) / FTS(18位) -> 人类可读单价
-  return Number(ethers.formatUnits(rUsdt, 18)) / Number(ethers.formatUnits(rFts, 18));
+  // v1.7.1: 交给纯函数统一校验 token0 归属与储备有效性
+  return computeFtsSpotPrice(r0, r1, t0, ftsAddr, usdtAddr, ethers.formatUnits);
 }
 // 扫描活跃挂单(status=1)，返回 [{id, seller, ftsAmount, totalPriceU, unitPrice}]，按单价升序
 async function scanMarketOrders(market, scanN) {
@@ -2746,14 +2867,15 @@ async function scanMarketOrders(market, scanN) {
   if (!Number.isFinite(nextId) || nextId <= 1) return [];
   const from = Math.max(1, nextId - scanN);
   const ids = Array.from({ length: nextId - from }, (_, i) => from + i);
-  const me = instances[0] ? instances[0].address.toLowerCase() : '';
+  // v1.7.1: 多账号时任何一个自有账号的挂单都不能被自己吃掉
+  const mine = new Set(instances.map(i => String(i.address || '').toLowerCase()));
   const results = await Promise.all(ids.map(async id => {
     try {
       const o = await mgr.rpc(p => market.orders(id));
       const status = Number(o.status !== undefined ? o.status : o[4]);
       if (status !== 1) return null;                       // 只关心活跃挂单
       const seller = String(o.seller !== undefined ? o.seller : o[0]);
-      if (seller.toLowerCase() === me) return null;        // 不吃自己的单
+      if (mine.has(seller.toLowerCase())) return null;      // 不吃任何一个自有账号的单
       const ftsAmount = BigInt(o.ftsAmount !== undefined ? o.ftsAmount : o[1]);
       const totalPriceU = BigInt(o.totalPriceU !== undefined ? o.totalPriceU : o[2]);
       if (ftsAmount <= 0n) return null;
@@ -2763,9 +2885,47 @@ async function scanMarketOrders(market, scanN) {
   }));
   return results.filter(Boolean).sort((a, b) => a.unitPrice - b.unitPrice);
 }
+// v1.7.1: 买单"今日已花费"必须跨重启累计，否则重启即清零、上限形同虚设。
+function readDailySpent(stateFile, addr, fsMod) {
+  try {
+    const d = JSON.parse(fsMod.readFileSync(stateFile, 'utf8'));
+    const day = new Date().toISOString().slice(0, 10);
+    const v = d && d[day] && d[day][String(addr).toLowerCase()];
+    return Number(v) > 0 ? Number(v) : 0;
+  } catch (e) { return 0; }
+}
+function writeDailySpent(stateFile, addr, spent, fsMod) {
+  try {
+    let d = {};
+    try { d = JSON.parse(fsMod.readFileSync(stateFile, 'utf8')) || {}; } catch (e) { }
+    const day = new Date().toISOString().slice(0, 10);
+    if (!d[day] || typeof d[day] !== 'object') d[day] = {};
+    d[day][String(addr).toLowerCase()] = spent;
+    const days = Object.keys(d).sort();
+    while (days.length > 7) delete d[days.shift()];
+    fsMod.writeFileSync(stateFile, JSON.stringify(d, null, 2), { mode: 0o600 });
+  } catch (e) { /* 状态写不了就退化为进程内计数，不阻断交易 */ }
+}
+// v1.7.1: 查自己名下仍活跃的挂单，避免同一价位反复 createOrder
+async function scanMyActiveOrders(market, addr, scanN) {
+  const nextId = Number(await mgr.rpc(p => market.nextOrderId()));
+  if (!Number.isFinite(nextId) || nextId <= 1) return [];
+  const from = Math.max(1, nextId - scanN);
+  const mine = String(addr).toLowerCase();
+  const ids = Array.from({ length: nextId - from }, (_, i) => from + i);
+  const out = await Promise.all(ids.map(async id => {
+    try {
+      const o = await mgr.rpc(p => market.orders(id));
+      const status = Number(o.status !== undefined ? o.status : o[4]);
+      const seller = String(o.seller !== undefined ? o.seller : o[0]);
+      return status === 1 && seller.toLowerCase() === mine ? id : null;
+    } catch (e) { return null; }
+  }));
+  return out.filter(x => x !== null);
+}
 // 买单循环: 单价低于阈值时吃单，总额不超上限
 async function tradeBuyLoop(inst, market) {
-  let spent = 0;
+  let spent = readDailySpent(CFG.TRADE_STATE_FILE, inst.address, fs);
   while (true) {
     try {
       if (CFG.TRADE_BUY_MAX_PRICE === null || CFG.TRADE_BUY_MAX_TOTAL === null) {
@@ -2786,7 +2946,11 @@ async function tradeBuyLoop(inst, market) {
           label: `[买单] 吃单#${o.id} 单价${o.unitPrice.toFixed(4)}U`,
           contract: market, method: 'fillOrder', args: [o.id]
         });
-        if (okTx) { spent += cost; info(inst.address, `[买单] 已吃单#${o.id} 花费 ${cost.toFixed(2)}U，累计 ${spent.toFixed(2)}U`); }
+        if (okTx) {
+          spent += cost;
+          writeDailySpent(CFG.TRADE_STATE_FILE, inst.address, spent, fs);
+          info(inst.address, `[买单] 已吃单#${o.id} 花费 ${cost.toFixed(2)}U，今日累计 ${spent.toFixed(2)}U`);
+        }
         if (spent >= CFG.TRADE_BUY_MAX_TOTAL) break;
       }
     } catch (e) {
@@ -2798,6 +2962,7 @@ async function tradeBuyLoop(inst, market) {
 // 卖单循环: 读真实价，满足条件时挂单(createOrder)
 async function tradeSellLoop(inst, market) {
   let listed = 0;
+  let lastAt = 0;
   while (true) {
     try {
       const spot = await getFtsSpotPrice(market);
@@ -2811,14 +2976,28 @@ async function tradeSellLoop(inst, market) {
       } else {
         warnOnce(inst.address, '卖单模式无效(应设 fixed 或 spotminus)，跳过', 300000);
       }
+      // v1.7.1: 三道闸门 —— 累计上限 / 冷却 / 已有活跃挂单，杜绝条件满足时无限重复挂单
+      const maxOrders = Math.max(1, Number(CFG.TRADE_SELL_MAX_ORDERS) || 1);
+      if (listed >= maxOrders) {
+        warnOnce(inst.address, `卖单累计已挂 ${listed} 单达到上限 ${maxOrders}，不再重复挂单`, 300000);
+        await sleep(CFG.TRADE_CHECK_MS); continue;
+      }
+      if (Date.now() - lastAt < (Number(CFG.TRADE_SELL_COOLDOWN_MS) || 300000)) {
+        await sleep(CFG.TRADE_CHECK_MS); continue;
+      }
       if (shouldSell && targetPrice > 0 && CFG.TRADE_SELL_AMOUNT !== null) {
+        const mine = await scanMyActiveOrders(market, inst.address, CFG.TRADE_BUY_SCAN_N);
+        if (mine.length) {
+          warnOnce(inst.address, `已有 ${mine.length} 个自己的活跃挂单，跳过本次挂单`, 300000);
+          await sleep(CFG.TRADE_CHECK_MS); continue;
+        }
         const ftsAmount = ethers.parseUnits(String(CFG.TRADE_SELL_AMOUNT), 18);
         const totalPriceU = ethers.parseUnits((targetPrice * CFG.TRADE_SELL_AMOUNT).toFixed(6), 18);
         const okTx = await sendTx(inst, {
           label: `[卖单] 挂 ${CFG.TRADE_SELL_AMOUNT} FTS @${targetPrice.toFixed(4)}U(真实价${spot.toFixed(4)})`,
           contract: market, method: 'createOrder', args: [ftsAmount, totalPriceU]
         });
-        if (okTx) { listed++; info(inst.address, `[卖单] 已挂单 ${CFG.TRADE_SELL_AMOUNT} FTS @${targetPrice.toFixed(4)}U`); }
+        if (okTx) { listed++; lastAt = Date.now(); info(inst.address, `[卖单] 已挂单 ${CFG.TRADE_SELL_AMOUNT} FTS @${targetPrice.toFixed(4)}U (累计 ${listed}/${maxOrders})`); }
       }
     } catch (e) {
       warnOnce(inst.address, '卖单循环异常: ' + formatError(e).slice(0, 120), 60000);
@@ -2922,8 +3101,8 @@ async function cmdEncrypt() {
     fs.writeFileSync(tmp, JSON.stringify(enc), { mode: 0o600 });
     fs.renameSync(tmp, WALLETS_FILE);
   } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (e) { } } }
-  // 明文 buffer 尽力清零
-  raw && (() => { })();
+  // v1.7.1: 删除了原来的 `raw && (()=>{})();` —— 它是空操作，且 JS 字符串不可变，
+  // 无法可靠清零。真实保护来自 0600 权限 + AES-GCM 加密 + 明文不写日志/不回显。
   ok('CFG', `wallets.json 已加密(${obj.wallets.length} 个账号)。运行时用环境变量 FTS_WALLET_PASSWORD 提供密码`);
   warn('CFG', '⚠️ 请务必记住密码，丢失后无法恢复钱包！');
   exitFlush(0);
@@ -2937,6 +3116,9 @@ async function main() {
       const r = await syncWebContracts(true);
       ok('SYS', `网页合约同步完成: 写入 ${r.changed} 项; 抓取 ${r.jsUrls.length} 个 JS`);
       for (const [k, v] of Object.entries(r.accepted)) console.log(`  ${k} = ${v}`);
+      if (r.rejected && Object.keys(r.rejected).length) {
+        warn('SYS', `以下字段按安全策略未写回: ${Object.entries(r.rejected).map(([k, v]) => k + '(' + v + ')').join(', ')}`);
+      }
       exitFlush(0);
     } catch (e) { fatal('SYS', '网页合约同步失败: ' + formatError(e)); exitFlush(1); }
     return;
@@ -2961,7 +3143,7 @@ async function main() {
 
   try { await mgr.pickBest(); }
   catch (e) { fatal('SYS', 'RPC 初始化失败: ' + formatError(e)); exitFlush(22); return; }
-  // 网页合约自动同步: 后台异步检测，不阻塞启动。发现新合约写回 config.json，下次重启生效。
+  // 网页合约同步: 默认关闭(WEB_AUTO_SYNC=false)。开启后也只在链上校验通过且非资金字段时写回。
   if (CFG.WEB_AUTO_SYNC && MODE === 'run') {
     syncWebContracts(true, false)   // 启动用轻量扫描(不拖带宽)，--sync-web 手动时才是完整扫描
       .then(r => { if (r.changed) warn('SYS', `网页检测到 ${r.changed} 个合约地址变化，已写入 config.json，重启后生效`); })
