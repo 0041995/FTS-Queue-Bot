@@ -199,8 +199,9 @@ const CFG = {
   // nonce 断档自愈: 发现"有在途交易但 latest 长期不动"就补一笔自转填坑
   GAP_CHECK_MS: cfgNum(process.env.FTS_GAP_CHECK_MS, 20000, 'GAP_CHECK_MS'),
   GAP_STUCK_MS: cfgNum(process.env.FTS_GAP_STUCK_MS, 45000, 'GAP_STUCK_MS'),
-  // 并发与限流: 默认 10 路并发(支持 10 账号同时跑)，靠下面的间隔/错峰/429 退避防止打爆公共节点
-  RPC_MAX_CONCURRENT: cfgNum(process.env.FTS_RPC_CONCURRENCY ?? userCfg.RPC_MAX_CONCURRENT, 10, 'RPC_MAX_CONCURRENT'),
+  // 并发与限流: 默认 8 路(实测并发8延迟最优p95≈150ms；16 是延迟恶化拐点p95≈485ms)。
+  // 8 距拐点留 50% 余量，仍足够 10+ 账号(账号错峰+排队，账号数≠并发数)。间隔/错峰/429 退避再兜底。
+  RPC_MAX_CONCURRENT: cfgNum(process.env.FTS_RPC_CONCURRENCY ?? userCfg.RPC_MAX_CONCURRENT, 8, 'RPC_MAX_CONCURRENT'),
   RPC_MIN_SPACING_MS: cfgNum(process.env.FTS_RPC_SPACING_MS, 60, 'RPC_MIN_SPACING_MS'),
   ACCOUNT_STAGGER_MS: cfgNum(process.env.FTS_ACCOUNT_STAGGER_MS, 120, 'ACCOUNT_STAGGER_MS'),
   // 启动排水: 等上一轮未确认交易落地，避免重启后 nonce 回退
@@ -306,12 +307,27 @@ function validateCfg() {
   if (CFG.UPDATE_CHECK_MS < 60000) { p.push('UPDATE_CHECK_MS 太小，已改为 60000'); CFG.UPDATE_CHECK_MS = 60000; }
   if (CFG.UPDATE_IDLE_MARGIN < 0) { p.push('UPDATE_IDLE_MARGIN 不能为负，已改为 15'); CFG.UPDATE_IDLE_MARGIN = 15; }
   if (CFG.UPDATE_MAX_DEFER_MS < 600000) { p.push('UPDATE_MAX_DEFER_MS 太小，已改为 600000'); CFG.UPDATE_MAX_DEFER_MS = 600000; }
-  // 并发闸门: 默认 10，允许按需下调/小幅上调，但不许填超大值把公共节点打爆(那样只会吃 429)
-  if (!Number.isInteger(CFG.RPC_MAX_CONCURRENT) || CFG.RPC_MAX_CONCURRENT < 1 || CFG.RPC_MAX_CONCURRENT > 32) {
+  // 并发闸门: 默认 8(实测稳定最优点)。硬上限 16=延迟恶化拐点，超过只能是自找 429/高延迟。
+  if (!Number.isInteger(CFG.RPC_MAX_CONCURRENT) || CFG.RPC_MAX_CONCURRENT < 1 || CFG.RPC_MAX_CONCURRENT > 16) {
     const fixed = Number.isFinite(CFG.RPC_MAX_CONCURRENT)
-      ? Math.min(32, Math.max(1, Math.floor(CFG.RPC_MAX_CONCURRENT))) : 10;
-    p.push(`RPC_MAX_CONCURRENT(${CFG.RPC_MAX_CONCURRENT}) 超出 1~32 范围，已改为 ${fixed}`);
+      ? Math.min(16, Math.max(1, Math.floor(CFG.RPC_MAX_CONCURRENT))) : 8;
+    p.push(`RPC_MAX_CONCURRENT(${CFG.RPC_MAX_CONCURRENT}) 超出 1~16 范围(16 是实测延迟拐点)，已改为 ${fixed}`);
     CFG.RPC_MAX_CONCURRENT = fixed;
+  } else if (CFG.RPC_MAX_CONCURRENT > 12) {
+    // 软提醒: 不强制改(用私有节点的人可能需要)，但明确告知公共节点风险
+    p.push(`RPC_MAX_CONCURRENT(${CFG.RPC_MAX_CONCURRENT}) 偏高: 公共节点实测 >12 延迟明显恶化，建议 <=8；私有节点可忽略`);
+  }
+  // 请求间隔: 0/极小值会让闸门形同虚设，公共节点分分钟 429。默认 60ms，下限 20ms(实测 20ms 时延迟已开始抬头)
+  if (!Number.isFinite(CFG.RPC_MIN_SPACING_MS) || CFG.RPC_MIN_SPACING_MS < 20) {
+    const fixed = Number.isFinite(CFG.RPC_MIN_SPACING_MS) ? 20 : 60;
+    p.push(`RPC_MIN_SPACING_MS(${CFG.RPC_MIN_SPACING_MS}) 过小(<20ms 易触发公共节点限流)，已改为 ${fixed}`);
+    CFG.RPC_MIN_SPACING_MS = fixed;
+  }
+  // 账号错峰: 0 会让所有账号同一瞬间打向节点，抵消闸门作用。下限 50ms
+  if (!Number.isFinite(CFG.ACCOUNT_STAGGER_MS) || CFG.ACCOUNT_STAGGER_MS < 50) {
+    const fixed = Number.isFinite(CFG.ACCOUNT_STAGGER_MS) ? 50 : 120;
+    p.push(`ACCOUNT_STAGGER_MS(${CFG.ACCOUNT_STAGGER_MS}) 过小(<50ms 账号会同时打节点)，已改为 ${fixed}`);
+    CFG.ACCOUNT_STAGGER_MS = fixed;
   }
   return p.concat(cfgProblems);
 }

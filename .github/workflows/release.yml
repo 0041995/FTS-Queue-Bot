@@ -62,7 +62,9 @@ jobs:
           node test/sendtx-nonce.js
           node test/approve-guard.js
           node test/claims-flex.js
-          node test/semaphore-concurrency.js 10
+          node test/semaphore-concurrency.js 8
+          node test/semaphore-concurrency.js 16
+          node test/rate-limits.js
 
       - name: 生成校验和
         run: |

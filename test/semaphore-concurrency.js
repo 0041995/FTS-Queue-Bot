@@ -33,7 +33,7 @@ for (let j = text.indexOf('{', start); j < text.length; j++) {
 }
 const classSrc = text.slice(start, end);
 
-const MAX = Number(process.argv[2]) || 10;
+const MAX = Number(process.argv[2]) || 8;
 const stubs = {
   CFG: { RPC_MIN_SPACING_MS: 0 },
   sleep: async () => { }
