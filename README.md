@@ -5,7 +5,7 @@
 > 帮你自动排队、自动领退款和 FTS 空投、自动处理中奖额度的本地小工具。
 > 不托管资金、不抽成、不联网上传私钥。
 >
-> **当前版本：v1.8.4**（修复 selftest 节点超时：剔除失效官方节点、探测短超时、并行轮换、合约对象随节点重绑；依赖安装杜绝交互提示，详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)）
+> **当前版本：v1.8.5**（修复半残节点不支持 eth_call 导致的读轮次失败：探测加严+运行时自动冷却换节点，详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)）
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Latest Release](https://img.shields.io/github/v/release/0041995/FTS-Queue-Bot)](https://github.com/0041995/FTS-Queue-Bot/releases/latest)

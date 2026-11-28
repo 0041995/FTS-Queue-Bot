@@ -31,8 +31,8 @@ const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
 // v1.7.1: 引擎日志版本与发行包版本统一，不再出现两套互不相同的版本号。
-// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.4。
-const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.4';
+// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.5。
+const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.5';
 const VERSION = APP_VERSION;
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
@@ -109,13 +109,13 @@ const CFG = {
       // 2026-11-28 实测: 官方 dataseed 系列 eth_call 全部超时(8~13s)，已从默认池移除。
       // 下列节点均实测 eth_call 连续 2 次正常(0.8~2.2s)，按延迟排序。
       'https://bsc-mainnet.public.blastapi.io', // ~1.1s
-      'https://bsc.meowrpc.com',                // ~1.1s
       'https://bsc-rpc.publicnode.com',         // ~1.4s
       'https://rpc-bsc.48.club',                // ~1.5s
       'https://bsc.rpc.sentio.xyz',             // ~1.6s
       'https://bsc.publicnode.com'              // ~1.7s
       // 官方 dataseed/0/1/2/3/4、binance.org、binance.technical.io、bnbchain.world
       // 实测 eth_call 超时或极不稳定(0.5s~TIMEOUT 反复)，全部剔除。
+      // meowrpc.com: 读 USDT 能过但读队列合约报 "The method eth_call is not supported."，剔除。
       // pocket.network 高并发频繁 429，剔除。
     ], 'HTTP_POOL').map(s => String(s).trim()).filter(Boolean),
   WSS_POOL: process.env.FTS_WSS_POOL
@@ -752,6 +752,13 @@ function isRateLimited(e) {
   const s = (e.shortMessage || e.message || '') + (e.info && e.info.error && e.info.error.message || '');
   return e.code === 'SERVER_ERROR' && /429|too many requests|rate limit|over rate|exceed/i.test(s);
 }
+// v1.8.5: 有些公共节点只允许 eth_blockNumber/eth_getBalance，读合约时返回
+// "The method eth_call is not supported." —— 这是节点能力问题(不是业务 revert)，
+// 必须冷却换节点，否则会一直打同一个废节点刷 CALL_EXCEPTION。
+function isNodeCallUnsupported(e) {
+  const s = rpcDetail(e) + ' ' + (e && e.info && e.info.error && e.info.error.message || '');
+  return /eth_call is not supported|method .*not supported|method not allowed|not supported.*eth_call/i.test(s);
+}
 // 节点冷却表: 被限流的节点短时间内不再使用
 const cooldown = new Map();
 const cooldownLeft = url => Math.max(0, (cooldown.get(url) || 0) - Date.now());
@@ -782,6 +789,11 @@ class RpcManager {
       // v1.8.4: 探测用短超时(默认5s)，坏节点快速失败；正式调用仍用 RPC_TIMEOUT_MS(12s)。
       const ret = await withTimeout(p.call({ to: CFG.USDT_ADDR, data: '0x313ce567' }), CFG.PROBE_TIMEOUT_MS, 'eth_call');
       if (!ret || ret === '0x') throw new Error('eth_call 返回空');
+      // v1.8.5: 再读一次队列合约的 roomCount()（selector 0xdf93a4e3，正常返回 4）。
+      // 实测有节点(meowrpc)只读 USDT 能过、读队列却返回 "The method eth_call is not supported."，
+      // 必须在探测阶段就筛掉这种半残节点。用 roomCount 而非 currentRound，后者在无轮次时会 revert。
+      const qret = await withTimeout(p.call({ to: CFG.QUEUE_ADDR, data: '0xdf93a4e3' }), CFG.PROBE_TIMEOUT_MS, 'eth_call(queue)');
+      if (!qret || qret === '0x') throw new Error('队列合约 eth_call 返回空');
       return { url, latency: Date.now() - t0, height: h, ok: true };
     } catch (e) {
       return { url, ok: false, error: e };
@@ -879,10 +891,14 @@ class RpcManager {
         await sleep(backoff);
         continue;
       }
-      const transient = ['NETWORK_ERROR', 'SERVER_ERROR', 'TIMEOUT', 'BAD_DATA'].includes(lastErr.code) || !lastErr.code;
+      const nodeBroken = isNodeCallUnsupported(lastErr) || isNetworkErr(lastErr);
+      const transient = ['NETWORK_ERROR', 'SERVER_ERROR', 'TIMEOUT', 'BAD_DATA'].includes(lastErr.code) || !lastErr.code || nodeBroken;
       if (transient) {
-        if (usedNode) { usedNode.failed++; nodePool.cooldown(usedNode, this.failStreak >= 2 ? 15000 : 3000); }
-        if (this.failStreak >= 2) await this.rotate();
+        if (usedNode) { usedNode.failed++; nodePool.cooldown(usedNode, nodeBroken ? 300000 : (this.failStreak >= 2 ? 15000 : 3000)); }
+        if (nodeBroken || this.failStreak >= 2) {
+          warnOnce('SYS', `节点不可用(${formatError(lastErr).slice(0, 70)})，冷却并切换: ${usedNode ? usedNode.url : ''}`, 60000);
+          await this.rotate();
+        }
         await sleep(400 * (i + 1));
         continue;
       }

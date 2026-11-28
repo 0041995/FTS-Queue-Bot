@@ -23,15 +23,23 @@ const check = (n, c, d) => { if (c) { pass++; console.log('  ✅ ' + n); } else 
 // 1) 节点池
 const bad = ['bsc-dataseed.bnbchain.org', 'bsc-dataseed1.bnbchain.org', 'bsc-dataseed2', 'bsc-dataseed3', 'bsc-dataseed4', 'bsc-dataseed1.binance.org'];
 for (const b of bad) check('默认池不含失效节点 ' + b, !core.includes("'https://" + b + "'"));
-for (const g of ['bsc-mainnet.public.blastapi.io', 'bsc.meowrpc.com', 'bsc-rpc.publicnode.com', 'bsc.rpc.sentio.xyz', 'rpc-bsc.48.club', 'bsc.publicnode.com']) {
+for (const g of ['bsc-mainnet.public.blastapi.io', 'bsc-rpc.publicnode.com', 'bsc.rpc.sentio.xyz', 'rpc-bsc.48.club', 'bsc.publicnode.com']) {
   check('默认池含正常节点 ' + g, core.includes("'https://" + g + "'") || core.includes('https://' + g));
 }
+
+// 1b) meowrpc 半残节点已剔除
+check('默认池不含 meowrpc(不支持队列eth_call)', !core.includes("'https://bsc.meowrpc.com'"));
 
 // 2) 探测超时
 check('有 PROBE_TIMEOUT_MS 配置项', /PROBE_TIMEOUT_MS:\s*cfgNum/.test(core));
 const probeFn = core.slice(core.indexOf('async probe(url)'), core.indexOf('async pickBest()'));
 check('probe 用 PROBE_TIMEOUT_MS 探测 getBlockNumber', probeFn.includes('CFG.PROBE_TIMEOUT_MS') && probeFn.includes('getBlockNumber'));
 check('probe 用 PROBE_TIMEOUT_MS 探测 eth_call', probeFn.includes('CFG.PROBE_TIMEOUT_MS') && probeFn.includes('eth_call'));
+check('probe 额外探测队列合约 roomCount()', probeFn.includes('0xdf93a4e3') && probeFn.includes('CFG.QUEUE_ADDR'));
+check('有 isNodeCallUnsupported 识别函数', /function isNodeCallUnsupported/.test(core));
+check('探测识别不支持eth_call的半残节点', /eth_call is not supported/.test(core));
+check('mgr.rpc 把节点故障纳入transient', /nodeBroken/.test(core) && /isNodeCallUnsupported\(lastErr\)/.test(core));
+check('节点故障时冷却5分钟', /nodeBroken \? 300000/.test(core));
 
 // 3) rotate 并行
 const rotateFn = core.slice(core.indexOf('async _rotate()'), core.indexOf('async rpc(fn'));

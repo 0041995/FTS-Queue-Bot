@@ -1,3 +1,18 @@
+# v1.8.5 — 修复半残节点 eth_call 不支持导致的读轮次失败
+
+基于 v1.8.4。修复"房间读取当前轮次失败: missing revert data | The method eth_call is not supported."
+
+**诊断**：不是没有轮次，是节点 `bsc.meowrpc.com` 的半残行为——读 USDT decimals 能过，读队列合约却明确返回 "The method eth_call is not supported."。它被选中后，每轮读轮次都失败。
+
+1. **剔除 meowrpc**：从默认节点池移除（探测/实测均证实其队列 eth_call 不可用）。
+2. **探测加严**：节点探测除了读 USDT decimals，再读队列合约 `roomCount()`（selector `0xdf93a4e3`，正常返回 4）。只读 USDT 能过但读队列失败的半残节点，在探测阶段就被筛掉。
+3. **运行时自动冷却换节点**：新增 `isNodeCallUnsupported()`，把 "eth_call is not supported" 识别为节点故障（不是业务 revert）。`mgr.rpc` 遇到这类错误会**冷却该节点 5 分钟并立即切换重试**，不再一直打废节点刷 CALL_EXCEPTION。
+4. 顺带把网络类错误（`isNetworkErr`）也纳入同样的冷却切换路径。
+
+**验证**：新增测试覆盖（37 项），18 个测试文件全过。实测 `--run` 60 秒：5/5 节点健康，`eth_call is not supported` **0 次**，读轮次失败 **0 次**。
+
+---
+
 # v1.8.4 — 修复 selftest 节点超时 / 依赖安装无交互
 
 基于 v1.8.3。修复你遇到的 selftest 卡在"合约存在性"后 TIMEOUT 退出：
