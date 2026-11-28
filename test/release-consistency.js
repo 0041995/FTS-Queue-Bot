@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 发行一致性检查（v1.7.1）
+ * 发行一致性检查（v1.8.0）
  *
  * 保证"源代码、发行版、README"三者对得上：
  *   - VERSION / README / RELEASE_NOTES / core.js 的版本号都是 1.7.1
@@ -16,7 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const ROOT = path.dirname(__dirname);
-const VER = '1.7.1';
+const VER = '1.8.0';
 
 let bad = 0;
 function check(name, cond, detail) {
@@ -100,7 +100,7 @@ check('校验 VERSION 与 tag 一致', wf.includes('校验 VERSION 与 tag 一�
 check('Release 正文统一用 RELEASE_NOTES.md', wf.includes('--notes-file RELEASE_NOTES.md'));
 check('同版本可覆盖附件', wf.includes('--clobber'));
 check('用 build.py 生成校验和', wf.includes('python3 build/build.py'));
-for (const t of ['web-sync.js', 'trade.js', 'safety-guards.js', 'update-vercmp.js', 'release-consistency.js']) {
+for (const t of ['web-sync.js', 'trade.js', 'safety-guards.js', 'update-vercmp.js', 'release-consistency.js', 'perf-guards.js']) {
   check('CI 跑 test/' + t, wf.includes('node test/' + t));
 }
 

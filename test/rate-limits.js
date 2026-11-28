@@ -42,7 +42,7 @@ function run(cfg) {
 }
 
 const cases = [
-  { name: '默认并发=8', cfg: { RPC_MAX_CONCURRENT: 8, RPC_MIN_SPACING_MS: 60, ACCOUNT_STAGGER_MS: 120 },
+  { name: '并发=8 边界(注入桩值)', cfg: { RPC_MAX_CONCURRENT: 8, RPC_MIN_SPACING_MS: 60, ACCOUNT_STAGGER_MS: 120 },
     check: r => r.CFG.RPC_MAX_CONCURRENT === 8 && r.problems.length === 0 },
   { name: '并发>16 钳到16', cfg: { RPC_MAX_CONCURRENT: 200, RPC_MIN_SPACING_MS: 60, ACCOUNT_STAGGER_MS: 120 },
     check: r => r.CFG.RPC_MAX_CONCURRENT === 16 },

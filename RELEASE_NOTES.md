@@ -1,65 +1,117 @@
-# v1.7.1 — 安全加固与文档/发行一致性修复
+# v1.8.0 — 零行为变化的资源占用优化
 
-> 本版本是对 v1.7.0 的一次**安全修补**，不含新玩法功能。修改依据是对 v1.7.0 tag 源码与 Release 附件的逐行审查（共 6 个附件、SHA-256 与官方 digest 6/6 一致）。
-> 升级后请重新核对 `config.json`：`WEB_AUTO_SYNC`、`AUTO_UPDATE` 两个自动入口现在默认关闭，需要你显式打开。
+> **本版的约束：优化不得让脚本变不稳定，不得漏掉场次 / 领取，不得抬高入场延迟；关键数据严格按 v1.7.1 原样。**
+> 因此本版只保留「不改变任何链上请求时序、不改变任何判定结果」的四处资源占用改动，其余早期性能优化方案**全部放弃**。
+> 基于 v1.7.1 tag（`37ee59f`）逐字节基线重建，可用 `git diff v1.7.1 v1.8.0` 逐行核对。
 
-## 1. 资金安全（高危）
+---
 
-1. **网页合约同步不再能污染授权对象**。旧版在 RPC 不可用时 `valid={}`，`valid[k] !== false` 恒为 true，网页上任意地址都会被写回 `config.json`，随后成为 USDT `approve` 的 spender。现在：
-   - 链上校验必须**显式返回 true** 才接受；RPC 不可用 / 校验失败时**一个地址都不写回**；
-   - `QUEUE_ADDR` / `USDT_ADDR` / `MINER_QUEUE_ADDR` / `MARKET_ADDR` 作为资金相关字段**默认冻结**，需显式设置 `WEB_SYNC_ALLOW_FUNDS_KEYS: true`；
-   - ABI 文本启发式的识别结果只用于提示，**绝不写回**；
-   - `WEB_AUTO_SYNC` 默认改为 `false`，`--sync-web` 会打印每个被拒绝字段及原因；
-   - 移除了 `FTS_ADDR` / `PAIR_ADDR` 两个永远没人读的死配置键（现货价本来就从市场合约的 `fts()` / `pair()` 读取）。
-2. **取消"填 0 = 授权钱包全部 USDT 余额"**。旧版 `[15] 授权额度` 填 0 会把当前全部余额授权给队列合约，与 README「不做无限授权」直接冲突。现在：
-   - 填 0 一律回落到「按 1 场票价」；
-   - 按场数模式最多 3 场、按 U 数模式最多 100 U；
-   - 余额不足一轮票价时直接跳过，不再发起注定无意义的 `approve`；
-   - 文案修正：`approve` 不锁定资金，减小的是 **spender 可划走的上限**，不是「资金占用」。
-3. **强制更新不再打断抢单**。旧版等满 2 小时后 `force=true` 会跳过 `isBusyForRestart()`，在交易在途时下载替换并 `exit 90`。现在无论推迟多久都先判断忙碌状态，超时只提示手动执行 `--update`；`isBusyForRestart()` 也补上了「抢位窗口内 / 结算开轮中」两个时点。
-4. **自动更新开关与 token 解绑**。旧版向导把 `AUTO_UPDATE` 写成 `UPDATE_TOKEN.length > 0`，公开仓库用户跑完 `--init` 后自动更新其实全程关闭。现在 `[10]` 独立询问开关，公开仓库无需 token 即可更新；401/403 会区分「需要 token」与「API 限流」，限流时退避而不是每 10 秒刷一次 API；下载改用 `browser_download_url` 而不是易触发 403 的 API asset 端点。
+## 0. 关键数据对照表（左列全部与 v1.7.1 一致，未改）
 
-## 2. 更新链与依赖供应链（中危）
+| 项目 | v1.7.1 | v1.8.0 | 为什么不动 |
+|---|---|---|---|
+| HTTP 轮询间隔 `POLL_INTERVAL_MS` | **1500ms** | **1500ms** | 改成 30s 心跳会在 WS 假连接 / 丢块时抬高入场延迟，可能漏掉抢位窗口与场次 |
+| WS stale 判据 `WS_STALE_MS` | 45000ms | 45000ms | 原样 |
+| `currentRound` 读取 | 每次实时读链 | 每次实时读链 | 加 2s 缓存会让领取轮次判断滞后，可能错过领取窗口 |
+| `TRADE_BUY_SCAN_N` | **200** | **200** | 缩到 60 会漏掉较早挂出的低价单 |
+| 买单扫描 | 每轮实时全表扫 | 每轮实时全表扫 | 加 8s 结果缓存会基于过期挂单做决策 |
+| 卖单 `scanMyActiveOrders` | 独立扫描 | 独立扫描 | 复用买单扫描会漏掉自有挂单，破坏 v1.7.1 的「不重复挂单」闸门 |
+| nonce 自愈巡检 | 串行 latest/pending | 串行 | 并行化改动请求时序，牵涉 nonce 正确性 |
+| 矿机产出领取巡检 | 串行逐金库 | 串行 | 用户明确要求「不能漏掉领取」，不动 |
+| 启动器写引擎文件 | **每次启动重写** | **每次启动重写** | 原版「每次重写」是发行包与运行时文件一致的保障，跳过写盘会让被篡改/损坏的文件一直留着 |
+| 网页合约探测 JS 下载 | 各阶段各自 fetch | 各阶段各自 fetch | 不动资金相关字段的识别链路 |
+| 并发默认值 `RPC_MAX_CONCURRENT` | 12 | 12 | 原样（仅修正注释笔误） |
+| 授权 / 抢位 / 资金字段冻结 / 自动更新开关 | 全部 v1.7.1 逻辑 | 全部 v1.7.1 逻辑 | 一行未改 |
 
-- `SHA256SUMS.txt` 现在由 `build/build.py` 统一生成，并用 GitHub Release API 返回的 `digest` 做**交叉校验**（脚本本体与校验和文件都核对），不再只信任同源的校验和文本；Windows 覆盖前保留带时间戳的多份备份。
-- 校验和行改为精确匹配文件名，预发布版本号（如 `1.8.0-beta`）在 `cmpVer()` 中正确低于正式版。
-- 发版工作流改为 **tag 触发**（`v*`）+ 手动触发，不再「任何 push 到 main 就自动发版」；同版本号再次构建会 `--clobber` 覆盖附件而不是静默跳过；Release 正文统一读取仓库里的 `RELEASE_NOTES.md`。
-- `ethers` 固定为 `6.15.0`、`ws` 固定为 `8.18.0`，安装带 `--ignore-scripts --save-exact`，装完校验 `require('ethers').version`；**移除第三方 npm 镜像自动回退**，Windows 版不再自动用 winget 安装 Node.js。
-- 向导 `[7] 添加账号` 在明文私钥落盘前即时校验「私钥是否对应该地址」，不匹配直接拒绝写入。
-- `cmdEncrypt()` 删除了无效的 `raw && (()=>{})()` 空操作，并如实说明 JS 字符串无法可靠清零。
-- `UPDATE_TOKEN` 明文写入 `config.json` 一事在 README 与向导里明确提示。
+**结论：抢单、领取、授权、轮询、更新这五条主链路，本版与 v1.7.1 逐字节等价。**
 
-## 3. 功能 bug
+---
 
-- **FTS 自动卖出**：新增「已有自己的活跃挂单不重复挂」「冷却 `TRADE_SELL_COOLDOWN_MS`（默认 5 分钟）」「累计上限 `TRADE_SELL_MAX_ORDERS`（默认 1）」三道闸门，修掉条件持续满足时无限重复 `createOrder` 的问题。
-- **FTS 自动买入**：`今日已花费` 落盘到 `trade-state.json`（按自然日、保留 7 天），重启不再清零。
-- **现货价**：`token0` 既不是 FTS 也不是 USDT 时返回 `null`，不再用错储备算出错误价格去挂单。
-- **多账号**：挂单扫描过滤所有自有账号，不再只比较 `instances[0]`。
-- **ABI 兜底**：上下文窗口从 6000 字符收紧到 600 字符，候选地址不唯一时一律放弃识别。
+## 1. 本版实际改动（四项，均不改变业务结果）
 
-## 4. 文档、注释与一致性
+### 1.1 `withTimeout()` 清理超时定时器
+`Promise.race` 不会取消落败分支：RPC 正常返回后，那个 12s 的超时 `setTimeout` 仍会挂到到点，高频调用下累积大量「已完成但仍待触发」的 Timeout 句柄。现在用 `finally { clearTimeout(timer) }` 清理。
 
-- README 里 3 处 `shishengh/FTS-Queue-Bot` 改为实际仓库 `0041995/FTS-Queue-Bot`；修正「启动时不会检查更新 / 启动即检测更新」自相矛盾、两处「不做无限授权」冲突、「没有任意转账能力」「无后台服务」等不实陈述。
-- 如实列出全部外联域名：BSC RPC/WSS 节点、`fatris.fans`、`api.github.com`、`registry.npmjs.org`、`1rpc.io`（推荐人识别）、`nodejs.org`（仅文档链接）。
-- 「全站扫描」改为准确描述：有上限抽样（完整扫描最多 15 页 / 40 个 JS / 2 轮 chunk，启动轻量扫描最多 8 个 JS），不再声称「全部」「实测 27 个」。
-- 引擎日志版本 `2.2-v8` 统一为发行包版本 `1.7.1`；`core.js` 里「不在启动时查」的过时注释全部更正。
-- CI 回归测试补上原先漏跑的 `test/web-sync.js`、`test/trade.js`，并新增 `test/safety-guards.js`、`test/update-vercmp.js`、`test/release-consistency.js`。
-- `dist/` 发行版产物入库，`VERSION`、`README.md`、`RELEASE_NOTES.md`、两个启动器模板、示例配置、`SHA256SUMS.txt` 全部对齐到 1.7.1。
+- 正常 resolve 的返回值、超时时的抛错时机与 `code: 'TIMEOUT'` 错误对象**完全一致**；
+- 本地实测：1000 次立即 resolve 的调用，活跃 Timeout 句柄 **1000 → 0**；
+- 同仓库 `fetchText()` 与 `update.js` 的 `api()` 本来就是这么写的，这里只是补齐。
 
-## 5. 已知限制（请务必阅读）
+### 1.2 `errSeen` 加容量上限与 TTL
+`errOnce` / `warnOnce` 的节流 key 归一化只替换十进制数字，tx.hash 这类长十六进制串会不断产生新 key，`errSeen` 是 v1.7.1 里唯一没有上限的 Map，长期挂机内存单调增长。现在：
+
+- 长十六进制串整体归一化为 `HEX`（顺序在十进制归一化之前，避免 hash 被先切碎）；
+- 容量上限 2000、TTL 5 分钟淘汰；
+- 节流 key 仍带 `addr`，不会把不同账号的告警合并。
+
+**只影响「同一条告警是否重复打印」，不参与任何交易 / 领取 / 入场判定。**
+
+### 1.3 `NodePool.pick()` 线性化
+原先每次 RPC 都 `filter` + `slice` + `sort`（两份临时数组 + O(n log n)）。改为一次线性扫描找 `(load, latency)` 最小者，零临时分配。
+
+- 新增回归测试用 **200 组随机负载 / 延迟 / 冷却状态**与旧 `sort` 实现对比，选节点结果**逐项一致**；
+- 节点池、分层并发闸门、冷却判定、重试逻辑全部原样。
+
+### 1.4 `fts-*.log` 按大小滚动
+外壳对 `console-*.log` 有 20MB 滚动，但引擎自己写的 `fts-YYYYMMDD.log` 只有按天分文件、无大小上限。现在按 `FTS_LOG_MAX_MB`（默认 20）切到 `fts-YYYYMMDD.N.log` 序号文件。用「切新文件」而非 rename，避开 `stream.end()` 异步与同名重建的竞态。`console.log` 保留（外壳 `tail -f` 依赖它做实时展示）。
+
+### 1.5 纯文档 / 测试
+- 修正注释「默认并发=8」的笔误（代码默认 12，8 是单测注入的边界值）；
+- README 新增 `ROOMS` 示例值为何是 `[0]` 的 FAQ（**不改示例值**：改成 `[0,1,2]` 会让复制配置的人多跑两个房间、多花资金）；
+- 新增 `test/perf-guards.js`；CI 回归测试从 13 项增至 14 项；
+- `VERSION` / README / RELEASE_NOTES / `core.js` 回落版本 / 发行产物 / SHA256SUMS 全部对齐 1.8.0。
+
+---
+
+## 2. 主动放弃的优化（及放弃原因）
+
+| 方案 | 放弃原因 |
+|---|---|
+| WS 健康时 HTTP 轮询降为 30s 心跳 | **会抬高入场延迟**；WS 连着但不推块、或丢块时，1.5s 轮询是最后的兜底。省下的请求不值得拿漏场次冒险 |
+| `currentRound` 复用共享状态 / 2s 短缓存 | 领取轮次判断可能滞后，命中「不能漏掉领取」 |
+| 买单扫描窗口 200→60 + 8s 结果缓存 | 属于关键数据变更，且可能基于过期挂单决策 |
+| Multicall 聚合 `orders(id)` | 需引入未经核验的外部聚合合约地址，新增信任根；且要验证公共节点响应体上限 |
+| 事件驱动维护活跃挂单集合 | 新状态机 + 重启后重建，需实盘压测 |
+| 三个后台巡检合并成全局单例协程 | 改变请求时序，牵涉 nonce 自愈正确性 |
+| `Semaphore.acquire()` 把最小间隔改成提交时刻节流 | 这是防 429 的保护，改动必须压测确认不触发限流 |
+| 启动器 `.new` + `cmp` 跳过写盘 | 破坏「每次启动重写引擎文件」的一致性保障；且 Node 24 下 `--check xxx.new` 会报 `ERR_UNKNOWN_FILE_EXTENSION`，是实测踩过的坑 |
+| 两次 BOM 清理合并成一次 node 冷启动 | 收益极小，且属于启动链改动，一并放弃 |
+| Windows 启动链同等优化 | PowerShell 5.1/7 兼容层语法不同，沙盒无 pwsh 可做等价验证 |
+
+---
+
+## 3. 升级注意
+
+- **`config.json` 无需任何改动**，新增字段为零；所有默认值与 v1.7.1 相同。
+- 唯一新增可选环境变量是 `FTS_LOG_MAX_MB`（日志滚动阈值，默认 20），不设也完全一样。
+- `fts-*.log` 可能出现 `.1` / `.2` 后缀的滚动文件，外壳 7 天清理的 glob `fts-*.log` 仍能覆盖。
+- 升级后仍建议按 `--probe → --init → --selftest → --dry-run → --run` 走一遍。
+
+---
+
+## 4. 验证方式
+
+```bash
+python3 build/build.py                 # 重建 dist/ 并生成 SHA256SUMS.txt
+cd dist && sha256sum -c SHA256SUMS.txt
+bash -n dist/autofts.sh
+node --check src/core.js && node --check src/probe.js && node --check src/update.js && node --check dist/update.js
+node test/perf-guards.js               # 定时器 / 节流表 / 节点选择等价性 / 关键数据未被改动
+node test/release-consistency.js       # 版本、产物、校验和一致性
+# 其余 12 项 v1.7.1 原有回归测试全部原样保留并通过
+```
+
+另外可直接核对稳定性基线：
+
+```bash
+git diff v1.7.1 v1.8.0 -- src/core.js     # 应只有 4 处资源改动 + 版本/注释
+git diff v1.7.1 v1.8.0 -- config.example.json templates/   # 应为空
+```
+
+---
+
+## 5. 已知限制（继承 v1.7.1，仍然成立）
 
 - `SHA256SUMS.txt` 与脚本仍来自**同一个 GitHub Release**，没有离线签名或固定公钥作为独立信任根；API `digest` 交叉校验只是多一层一致性检查。能发布 Release 的人理论上仍可同时替换两者。最稳妥的做法是自行 `python3 build/build.py` 重建并比对。
 - 公共 RPC 返回的状态没有多节点交叉验证，被篡改/滞后的节点数据仍可能影响入场判断。
-- 未实盘连接 BSC 验证合约；本版本的所有测试都是本地桩测试，不涉及链上资金。
+- 未实盘连接 BSC 验证合约；本版本的所有测试都是本地桩测试，不涉及链上资金，也未做 24 小时真实多账号压测。
 - 这是链上资金游戏，中奖由 Chainlink VRF 决定，脚本不保证盈利；请只用亏得起的小额资金与专用小号。
-
-## 6. 校验方式
-
-```bash
-python3 build/build.py          # 重建 dist/ 并生成 SHA256SUMS.txt
-cd dist && sha256sum -c SHA256SUMS.txt
-bash -n dist/autofts.sh
-node --check src/core.js && node --check src/probe.js && node --check src/update.js
-```
-
-首次使用仍按 `--probe → --init → --selftest → --dry-run → --run` 走一遍。

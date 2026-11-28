@@ -3,9 +3,9 @@
 /**
  * FTS 脚本自更新器（支持私有仓库 / 公开仓库）
  * 用法:
- *   node update.js --check  --current=1.7.1 --asset=autofts.sh [--quiet]
- *   node update.js --apply  --current=1.7.1 --asset=autofts.sh
- *   node update.js --auto   --current=1.7.1 --asset=autofts.sh
+ *   node update.js --check  --current=1.8.0 --asset=autofts.sh [--quiet]
+ *   node update.js --apply  --current=1.8.0 --asset=autofts.sh
+ *   node update.js --auto   --current=1.8.0 --asset=autofts.sh
  * 配置: config.json 里 UPDATE_REPO / UPDATE_TOKEN；也可用环境变量
  *   FTS_UPDATE_REPO / FTS_UPDATE_TOKEN
  *

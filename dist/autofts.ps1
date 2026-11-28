@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 <#
-    FTS 多账号自动打金脚本 - Windows 版 v1.7.1
+    FTS 多账号自动打金脚本 - Windows 版 v1.8.0
     同一个文件同时兼容 PowerShell 5.1 (Desktop) 与 PowerShell 7 (Core)
 
     用法:
@@ -250,7 +250,7 @@ $DoWizard  = $false
 $ProbeArgs = @()
 
 $Script:OrigArgs = @($args)
-$env:FTS_APP_VERSION = '1.7.1'
+$env:FTS_APP_VERSION = '1.8.0'
 for ($i = 0; $i -lt $args.Count; $i++) {
     $a = [string]$args[$i]
     if ($a -eq '--probe') {
@@ -383,8 +383,8 @@ const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
 // v1.7.1: 引擎日志版本与发行包版本统一，不再出现两套互不相同的版本号。
-// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.7.1。
-const APP_VERSION = process.env.FTS_APP_VERSION || '1.7.1';
+// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.0。
+const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.0';
 const VERSION = APP_VERSION;
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
@@ -757,7 +757,8 @@ function validateCfg() {
   else if (!Number.isInteger(CFG.TRADE_SELL_MAX_ORDERS) || CFG.TRADE_SELL_MAX_ORDERS < 1) {
     p.push('TRADE_SELL_MAX_ORDERS 必须 >=1，已改为 1'); CFG.TRADE_SELL_MAX_ORDERS = 1;
   }
-  // 并发闸门: 默认 8(实测稳定最优点)。硬上限 16=延迟恶化拐点，超过只能是自找 429/高延迟。
+  // 并发闸门: 代码默认 12；8 是早期实测的稳定最优点，也是单测注入的边界用例。
+  // 硬上限 16=延迟恶化拐点，超过只能是自找 429/高延迟。
   if (!Number.isInteger(CFG.RPC_MAX_CONCURRENT) || CFG.RPC_MAX_CONCURRENT < 1 || CFG.RPC_MAX_CONCURRENT > 16) {
     const fixed = Number.isFinite(CFG.RPC_MAX_CONCURRENT)
       ? Math.min(16, Math.max(1, Math.floor(CFG.RPC_MAX_CONCURRENT))) : 8;
@@ -783,13 +784,27 @@ function validateCfg() {
 }
 
 // ---------------- 日志 ----------------
+// v1.8.0: 单日 fts-*.log 原先没有大小上限（外壳只对 console-*.log 做了滚动），
+// 长期挂机可能写满磁盘。按 FTS_LOG_MAX_MB 切到带序号的新文件；用「切新文件」
+// 而不是 rename，避开 stream.end() 异步与同名重建的竞态。业务逻辑零改动。
 let logStream = null;
-try {
-  if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
-  const lf = path.join(LOG_DIR, 'fts-' + new Date().toISOString().slice(0, 10).replace(/-/g, '') + '.log');
-  logStream = fs.createWriteStream(lf, { flags: 'a' });
-  logStream.write(`\n===== 启动 v${VERSION} mode=${MODE} ${new Date().toLocaleString()} =====\n`);
-} catch (e) { /* 日志不可用时仅控制台 */ }
+let logStreamBytes = 0;
+let logSeq = 0;
+const LOG_MAX_BYTES = Math.max(1, Number(process.env.FTS_LOG_MAX_MB) || 20) * 1024 * 1024;
+function logFilePath() {
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  return path.join(LOG_DIR, 'fts-' + day + (logSeq ? '.' + logSeq : '') + '.log');
+}
+function openLogStream() {
+  try {
+    if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+    const f = logFilePath();
+    logStream = fs.createWriteStream(f, { flags: 'a' });
+    try { logStreamBytes = fs.statSync(f).size; } catch (e) { logStreamBytes = 0; }
+    logStream.write(`\n===== 启动 v${VERSION} mode=${MODE} ${new Date().toLocaleString()} =====\n`);
+  } catch (e) { /* 日志不可用时仅控制台 */ }
+}
+openLogStream();
 
 const C = { g: '\x1b[32m', r: '\x1b[31m', y: '\x1b[33m', b: '\x1b[36m', d: '\x1b[0m' };
 const tss = () => new Date().toLocaleTimeString('zh-CN', { hour12: false });
@@ -798,17 +813,43 @@ const short = a => (a || 'SYS').slice(0, 8);
 function log(level, addr, msg, color) {
   const line = `[${tss()}] [${level}] [${short(addr)}] ${msg}`;
   console.log((color || '') + line + C.d);
-  try { logStream.write(line + '\n'); } catch (e) { }
+  try {
+    if (logStreamBytes > LOG_MAX_BYTES) {
+      try { logStream && logStream.end(); } catch (e) { }
+      logSeq++;
+      openLogStream();
+    }
+    logStream.write(line + '\n');
+    logStreamBytes += Buffer.byteLength(line + '\n');
+  } catch (e) { }
 }
 // 同一原因的报错做节流，避免每个块刷屏（默认 60s 内只报一次）
+// v1.8.0: errSeen 原先是唯一没有上限的 Map —— 归一化只替换十进制数字，
+// tx.hash / 长十六进制串会不断产生新 key，长期挂机内存单调增长。现在加容量
+// 上限 + TTL 淘汰，并把长十六进制串整体归一化。只影响日志节流，不影响业务判定。
 const errSeen = new Map();
+const ERR_SEEN_MAX = 2000;
+const ERR_SEEN_TTL_MS = 300000;
+function normErrKey(m) {
+  // 顺序很重要：先整体吃掉 tx.hash 这类长串，再归一化十进制数字，否则
+  // hash 里的数字会先被切成一串 '#'，长串正则就再也匹配不上了。
+  return String(m).replace(/0x[a-fA-F0-9]{16,}/gi, 'HEX').replace(/\d+(\.\d+)?/g, '#');
+}
+function pruneErrSeen(now) {
+  if (errSeen.size <= ERR_SEEN_MAX) return;
+  const cutoff = now - ERR_SEEN_TTL_MS;
+  for (const [k, v] of errSeen) if (v < cutoff) errSeen.delete(k);
+  let drop = errSeen.size - ERR_SEEN_MAX;
+  if (drop > 0) for (const k of errSeen.keys()) { if (drop-- <= 0) break; errSeen.delete(k); }
+}
 function errOnce(addr, m, ms) {
   const gap = ms === undefined ? 60000 : ms;
-  const key = (addr || '') + '|' + m.replace(/\d+(\.\d+)?/g, '#');
+  const key = (addr || '') + '|' + normErrKey(m);
   const now = Date.now();
   const last = errSeen.get(key) || 0;
   if (now - last < gap) return;
   errSeen.set(key, now);
+  pruneErrSeen(now);
   err(addr, m);
 }
 
@@ -821,10 +862,11 @@ const fatal = (a, m) => log('FATAL', a, m, C.r);
 // 警告就是警告: 用黄色 WARN，不要打成红色 ERR 吓人
 function warnOnce(addr, m, ms) {
   const gap = ms === undefined ? 60000 : ms;
-  const key = 'W|' + (addr || '') + '|' + m.replace(/\d+(\.\d+)?/g, '#');
+  const key = 'W|' + (addr || '') + '|' + normErrKey(m);
   const now = Date.now();
   if (now - (errSeen.get(key) || 0) < gap) return;
   errSeen.set(key, now);
+  pruneErrSeen(now);
   warn(addr, m);
 }
 
@@ -892,8 +934,16 @@ function exitFlush(code) {
   try { process.stdout.write('', () => process.exit(code)); }
   catch (e) { process.exit(code); }
 }
+// v1.8.0: Promise.race 不会取消落败分支 —— 超时定时器会一直挂到 ms 到点。
+// 高频 RPC 下会累积大量「已完成但仍待触发」的 Timeout 句柄。finally 里显式
+// clearTimeout；返回值、超时抛错时机、错误对象与原版完全一致。
 function withTimeout(p, ms, label) {
-  return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(Object.assign(new Error('超时 ' + ms + 'ms: ' + (label || '')), { code: 'TIMEOUT' })), ms))]);
+  let timer = null;
+  const timeout = new Promise((_, rej) => {
+    timer = setTimeout(() => rej(Object.assign(
+      new Error('超时 ' + ms + 'ms: ' + (label || '')), { code: 'TIMEOUT' })), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => { if (timer !== null) clearTimeout(timer); });
 }
 
 // ---------------- ABI ----------------
@@ -989,11 +1039,26 @@ class NodePool {
   }
   // 选节点: 优先 preferred(账号专属节点)，其不可用/满则挑负载最低的健康节点
   pick(preferred) {
-    const healthy = this.nodes.filter(n => n.available);
-    const pool = healthy.length ? healthy : this.nodes;
     if (preferred && preferred.available && preferred.load < 0.9) return preferred;
-    // 负载最低优先，同负载按延迟低优先
-    return pool.slice().sort((a, b) => (a.load - b.load) || (a.latency - b.latency))[0];
+    // v1.8.0: 线性选 (load, latency) 最小者。原来每次 RPC 都 filter + slice + sort，
+    // 产生两份临时数组并做 O(n log n) 排序；线性扫描结果完全一致，零临时分配。
+    // 不改动节点池、并发闸门、冷却判定等任何逻辑。
+    let best = null, bestLoad = Infinity, bestLat = Infinity, sawHealthy = false;
+    for (const n of this.nodes) {
+      if (!n.available) continue;
+      sawHealthy = true;
+      const l = n.load;
+      if (l < bestLoad || (l === bestLoad && n.latency < bestLat)) {
+        best = n; bestLoad = l; bestLat = n.latency;
+      }
+    }
+    if (sawHealthy) return best;
+    // 全部冷却：退回负载最低（与旧行为一致）
+    let fallback = this.nodes[0];
+    for (const n of this.nodes) {
+      if (n.load < fallback.load || (n.load === fallback.load && n.latency < fallback.latency)) fallback = n;
+    }
+    return fallback;
   }
   // 在选中节点的闸门内执行 fn(provider, node)。核心: 把请求分散到各节点独立闸门。
   // fn 第二个参数是选中的节点对象，供 RpcManager 在 429/失败时精准冷却该节点。
@@ -3912,9 +3977,9 @@ $UpdateJs = @'
 /**
  * FTS 脚本自更新器（支持私有仓库 / 公开仓库）
  * 用法:
- *   node update.js --check  --current=1.7.1 --asset=autofts.sh [--quiet]
- *   node update.js --apply  --current=1.7.1 --asset=autofts.sh
- *   node update.js --auto   --current=1.7.1 --asset=autofts.sh
+ *   node update.js --check  --current=1.8.0 --asset=autofts.sh [--quiet]
+ *   node update.js --apply  --current=1.8.0 --asset=autofts.sh
+ *   node update.js --auto   --current=1.8.0 --asset=autofts.sh
  * 配置: config.json 里 UPDATE_REPO / UPDATE_TOKEN；也可用环境变量
  *   FTS_UPDATE_REPO / FTS_UPDATE_TOKEN
  *
@@ -4183,7 +4248,7 @@ if ($Mode -eq 'probe') {
 # --update: 原地替换脚本（私有仓库需在 config.json 写 UPDATE_TOKEN）
 if ($Mode -eq 'update') {
     Write-Host ""
-    & $Script:NodeExe update.js --apply --current="1.7.1" --asset=autofts.ps1
+    & $Script:NodeExe update.js --apply --current="1.8.0" --asset=autofts.ps1
     exit $LASTEXITCODE
 }
 

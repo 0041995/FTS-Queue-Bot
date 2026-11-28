@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 把 src/core.js、src/probe.js、src/update.js 注入两个模板，生成可直接分发的单文件脚本，
-并生成 dist/SHA256SUMS.txt（v1.7.1：本地发行版与 CI Release 附件使用同一套生成逻辑）。
+并生成 dist/SHA256SUMS.txt（v1.8.0：本地发行版与 CI Release 附件使用同一套生成逻辑）。
 
 产物:
     dist/autofts.sh        Linux / Termux / macOS 用，LF 换行，带执行位
@@ -125,7 +125,7 @@ def main():
             if "@@" in f.read():
                 sys.exit("错误: %s 里还有没替换的占位符" % os.path.basename(path))
 
-    # ---- v1.7.1: 统一生成 SHA256SUMS.txt ----
+    # ---- v1.8.0: 统一生成 SHA256SUMS.txt（逻辑同 v1.7.1）----
     summed = ["autofts.sh", "autofts.ps1", "update.sh", "update.ps1", "update.js"]
     sums_path = os.path.join(DIST_DIR, "SHA256SUMS.txt")
     lines = []

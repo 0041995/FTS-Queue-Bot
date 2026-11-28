@@ -62,7 +62,7 @@ jobs:
           node --check dist/update.js
           echo "引擎语法 OK"
 
-      - name: 回归测试（全部 13 项）
+      - name: 回归测试（全部 14 项）
         run: |
           npm install ethers@6.15.0 --no-audit --no-fund --ignore-scripts --no-save
           node test/sendtx-nonce.js
@@ -78,6 +78,7 @@ jobs:
           node test/safety-guards.js
           node test/update-vercmp.js
           node test/release-consistency.js
+          node test/perf-guards.js
 
       - name: 校验发行版校验和
         run: |

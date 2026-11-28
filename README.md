@@ -5,14 +5,28 @@
 > 帮你自动排队、自动领退款和 FTS 空投、自动处理中奖额度的本地小工具。
 > 不托管资金、不抽成、不联网上传私钥。
 >
-> **当前版本：v1.7.1**（安全加固版，详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)）
+> **当前版本：v1.8.0**（v1.7.1 稳定性不变，仅做零行为变化的资源占用优化，详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)）
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Latest Release](https://img.shields.io/github/v/release/0041995/FTS-Queue-Bot)](https://github.com/0041995/FTS-Queue-Bot/releases/latest)
 
 ---
 
-## v1.7.1 更新要点
+## v1.8.0 更新要点
+
+**这一版没有动任何抢单、领取、授权、轮询的时序与关键数据**，`POLL_INTERVAL_MS` 仍是 1500ms、`TRADE_BUY_SCAN_N` 仍是 200、`currentRound` 仍实时读链、启动器仍每次重写引擎文件。改动只落在「日志落盘、告警节流表、超时定时器、节点选择」这四处不改变业务结果的地方。
+
+- `withTimeout()` 清理落败分支的超时定时器：1000 次快速调用从 1000 个活跃 Timeout 句柄降到 0。
+- `errSeen` 加 2000 条容量上限与 5 分钟 TTL，消除长期挂机的内存单调增长（只影响重复告警是否打印）。
+- `NodePool.pick()` 由 `filter+slice+sort` 改线性扫描：200 组随机负载对比，选节点结果与 v1.7.1 **逐项一致**，零临时分配。
+- `fts-*.log` 按 20MB 滚动，避免长期挂机写满磁盘。
+- 新增 `test/perf-guards.js`，并修正「默认并发=8」的注释笔误（代码默认 12）。
+
+> 早期草稿里试过的「WS 健康时把轮询降到 30s」「`currentRound` 加 2s 缓存」「买单扫描窗口 200→60」「启动器跳过写盘」「nonce / 领取巡检并行化」**全部回退**：这些会抬高入场延迟、可能造成轮次判断滞后或漏掉领取，与「不能漏场次、不能延迟过大」的要求冲突。详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
+
+---
+
+## v1.7.1 更新要点（历史）
 
 这是一次**安全修补**，没有新增玩法。如果你从 v1.7.0 升级，最重要的一句话：**两个自动入口现在默认关闭**，需要你显式决定要不要打开。
 
@@ -268,6 +282,9 @@ bash autofts.sh --init
 **Q：会不会把我钱包里的钱转走？**
 脚本里**没有把资金转到外部地址的能力**：入场、领取、授权、组机都只跟游戏合约交互。但「完全没有转账能力」不准确 —— 默认关闭的灵活资金决策会在你自己的账号之间转 BNB / USDT，nonce 自愈会发 0 值自转，FTS 买卖会对市场合约下单。真正的风险是私钥明文存本地，机器安全靠你自己；请用专用小号、只放小额资金。
 
+**Q：示例配置里 `ROOMS` 为什么只有 `[0]`？**
+示例配置有意只启用房间 0，避免复制配置后意外在 3 个房间同时入场（代码默认值是 `[0,1,2]`，向导「恢复默认」也是 `"0,1,2"`）。房间数直接决定状态读取与入场请求量，按实际参与的房间配置最省资源。
+
 **Q：多开账号会冲突吗？**
 不会，每个账号独立计数、独立领取。脚本用**多节点分层**：账号自动平摊到 11 个优质 BSC 节点（5 个官方 + 6 个公共），每个节点有独立并发闸门，某节点忙不过来或被限流时，请求自动落到其它节点并行处理。**实测 100 个账号同时跑：400 次请求分散到 11 个节点，零限流、零失败、约 4 秒完成**。
 
@@ -310,6 +327,7 @@ node test/trade.js                  # FTS 自动买卖逻辑
 node test/safety-guards.js          # 授权上限 / 同步白名单 / 现货价 / ABI 兜底
 node test/update-vercmp.js          # 版本比较 / 校验和 / 限流分类
 node test/release-consistency.js    # 版本号与发行产物一致性
+node test/perf-guards.js           # v1.8.0 资源占用护栏（定时器/节流表/节点选择等价性）
 ```
 
 关键配置：`QUEUE_ADDR`（新队列）、`MINER_MODE`（old/new/both）、`MINER_USD`、`CLAIM_WIN`、`FLEX_DECISION`（灵活资金决策，默认 false）、`GAME_URL` / `WEB_AUTO_SYNC`（默认 false）/ `WEB_SYNC_ALLOW_FUNDS_KEYS`（默认 false）、`TRADE_BUY_ENABLED` / `TRADE_SELL_ENABLED`（默认 false）、`AUTO_UPDATE`（默认 false）。完整字段见 `config.example.json`。
