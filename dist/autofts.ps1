@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 <#
-    FTS 多账号自动打金脚本 - Windows 版 v1.8.0
+    FTS 多账号自动打金脚本 - Windows 版 v1.8.1
     同一个文件同时兼容 PowerShell 5.1 (Desktop) 与 PowerShell 7 (Core)
 
     用法:
@@ -250,7 +250,7 @@ $DoWizard  = $false
 $ProbeArgs = @()
 
 $Script:OrigArgs = @($args)
-$env:FTS_APP_VERSION = '1.8.0'
+$env:FTS_APP_VERSION = '1.8.1'
 for ($i = 0; $i -lt $args.Count; $i++) {
     $a = [string]$args[$i]
     if ($a -eq '--probe') {
@@ -383,8 +383,8 @@ const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
 // v1.7.1: 引擎日志版本与发行包版本统一，不再出现两套互不相同的版本号。
-// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.0。
-const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.0';
+// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.1。
+const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.1';
 const VERSION = APP_VERSION;
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
@@ -527,6 +527,9 @@ const CFG = {
   APPROVE_ROUNDS: cfgNum(process.env.FTS_APPROVE_ROUNDS ?? userCfg.APPROVE_ROUNDS, 1, 'APPROVE_ROUNDS'),
   APPROVE_MAX_ROUNDS: cfgNum(process.env.FTS_APPROVE_MAX_ROUNDS ?? userCfg.APPROVE_MAX_ROUNDS, 3, 'APPROVE_MAX_ROUNDS'),
   APPROVE_MAX_USD: cfgNum(process.env.FTS_APPROVE_MAX_USD ?? userCfg.APPROVE_MAX_USD, 100, 'APPROVE_MAX_USD'),
+  // 每日场次限制: 每天最多入场多少次。0=关闭(默认)。账号可在 wallets.json 里用
+  // DAILY_ENTRY_LIMIT 单独设(覆盖全局)。计数按本地日期，持久化到 entry-counter.json，重启不清零。
+  DAILY_ENTRY_LIMIT: cfgNum(process.env.FTS_DAILY_ENTRY_LIMIT ?? userCfg.DAILY_ENTRY_LIMIT, 0, 'DAILY_ENTRY_LIMIT'),
   // 中奖后是否自动领取矿机额度(claimWin)。中奖与否由 Chainlink VRF 随机决定，脚本无法干预。
   CLAIM_WIN: (() => {
     const raw = process.env.FTS_CLAIM_WIN ?? userCfg.CLAIM_WIN;
@@ -2207,6 +2210,59 @@ async function drainPending(inst) {
   }
 }
 
+// ---------------- 每日场次限制 ----------------
+// 计数持久化到 entry-counter.json，按本地日期切天，重启不清零。
+// 全局 DAILY_ENTRY_LIMIT 限制所有账号总和；账号 conf.DAILY_ENTRY_LIMIT 单独限制该账号(0=不额外限制)。
+const ENTRY_COUNTER_FILE = path.join(ROOT, 'entry-counter.json');
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function readEntryCounter() {
+  const today = todayKey();
+  try {
+    const o = JSON.parse(fs.readFileSync(ENTRY_COUNTER_FILE, 'utf8'));
+    if (o && o.date === today && typeof o.total === 'number' && o.accounts && typeof o.accounts === 'object') return o;
+  } catch (e) { /* 文件不存在/损坏 -> 从零开始 */ }
+  return { date: today, total: 0, accounts: {} };
+}
+function writeEntryCounter(c) {
+  const tmp = ENTRY_COUNTER_FILE + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(c));
+    fs.renameSync(tmp, ENTRY_COUNTER_FILE);
+  } catch (e) {
+    // 写失败不能影响抢单，但不能让计数丢失导致超限 -> 至少在内存里记住
+    warnOnce('SYS', '每日场次计数写入失败: ' + formatError(e).slice(0, 100), 60000);
+    try { fs.unlinkSync(tmp); } catch (e2) { }
+  }
+}
+// 返回 {allowed, reason, used, limit}；两个限制都关时直接放行，零开销。
+function checkEntryLimit(inst) {
+  const global = Math.max(0, Math.floor(Number(CFG.DAILY_ENTRY_LIMIT) || 0));
+  const acct = inst && inst.conf && inst.conf.DAILY_ENTRY_LIMIT !== undefined
+    ? Math.max(0, Math.floor(Number(inst.conf.DAILY_ENTRY_LIMIT) || 0)) : 0;
+  if (global <= 0 && acct <= 0) return { allowed: true, global: 0, acct: 0 };
+  const c = readEntryCounter();
+  const aUsed = inst ? (c.accounts[inst.address] || 0) : 0;
+  if (global > 0 && c.total >= global) {
+    return { allowed: false, reason: `全局每日 ${global} 场已用完(今日 ${c.total})`, used: c.total, limit: global };
+  }
+  if (acct > 0 && aUsed >= acct) {
+    return { allowed: false, reason: `本账号每日 ${acct} 场已用完(今日 ${aUsed})`, used: aUsed, limit: acct };
+  }
+  return { allowed: true, global, acct, used: c.total, aUsed };
+}
+// 入场成功后调用(确认 status=1)；写入失败也不阻断，仅告警。
+function recordEntry(inst) {
+  if (DRY_RUN) return null;   // 演练不上链，不计入真实场次
+  const c = readEntryCounter();
+  c.total = (c.total || 0) + 1;
+  if (inst && inst.address) c.accounts[inst.address] = (c.accounts[inst.address] || 0) + 1;
+  writeEntryCounter(c);
+  return c;
+}
+
 // ---------------- 抢单 ----------------
 async function snipeWithState(inst, rooms) {
   if (!inst || inst.busy) return;
@@ -2234,6 +2290,13 @@ async function snipeWithState(inst, rooms) {
 
       if (!(await ensureFunds(inst, st.ticketPrice, room))) { continue; }
 
+      // 每日场次限制: 在发交易前拦截，避免超限后还白烧 gas
+      const lim = checkEntryLimit(inst);
+      if (!lim.allowed) {
+        warnOnce(inst.address, `[${tag}] 跳过入场: ${lim.reason}`, 300000);
+        continue;
+      }
+
       inst.acted.add(key);
       const okTx = await sendTx(inst, {
         label: `[${tag}] 入场(当前 ${count} 人, 轮次 ${st.rId})`,
@@ -2241,7 +2304,8 @@ async function snipeWithState(inst, rooms) {
         method: 'enterQueue',
         args: [room, inst.referrer]
       });
-      if (!okTx) inst.acted.delete(key); // 失败允许重试
+      if (okTx) recordEntry(inst);       // 确认上链成功才计场次
+      else inst.acted.delete(key);       // 失败允许重试
     }
   } catch (e) {
     err(inst.address, '抢单流程异常: ' + formatError(e));
@@ -4248,7 +4312,7 @@ if ($Mode -eq 'probe') {
 # --update: 原地替换脚本（私有仓库需在 config.json 写 UPDATE_TOKEN）
 if ($Mode -eq 'update') {
     Write-Host ""
-    & $Script:NodeExe update.js --apply --current="1.8.0" --asset=autofts.ps1
+    & $Script:NodeExe update.js --apply --current="1.8.1" --asset=autofts.ps1
     exit $LASTEXITCODE
 }
 
@@ -4267,6 +4331,8 @@ $Script:WizAutoUpdate = '0'   # v1.7.1: 自动更新开关与 token 解绑，默
 $Script:WizBuyOn = '0'; $Script:WizBuyMaxPrice = ''; $Script:WizBuyMaxTotal = ''
 $Script:WizSellOn = '0'; $Script:WizSellMode = 'fixed'; $Script:WizSellPrice = ''; $Script:WizSellAmount = ''
 $Script:WizApproveMode = 'rounds'; $Script:WizApproveRounds = '1'; $Script:WizApproveUsd = ''
+$Script:WizWebSync = '0'; $Script:WizWebFunds = '0'
+$Script:WizDailyLimit = '0'
 $Script:WizAccountCount = -1   # -1 = 未缓存；每次重绘都起 node 会明显卡顿
 $Script:WizAccountStamp = [datetime]::MinValue   # 缓存时 wallets.json 的 mtime
 
@@ -4306,6 +4372,9 @@ put("TRADE_SELL_AMOUNT",c.TRADE_SELL_AMOUNT);
 if(c.APPROVE_USD!==undefined&&c.APPROVE_USD!==null){console.log("APPROVE_MODE=usd");put("APPROVE_USD",c.APPROVE_USD);}
 else{console.log("APPROVE_MODE=rounds");put("APPROVE_ROUNDS",c.APPROVE_ROUNDS);}
 console.log("AUTO_UPDATE="+(c.AUTO_UPDATE===true||c.AUTO_UPDATE===1||c.AUTO_UPDATE==="true"?"1":"0"));
+put("DAILY_ENTRY_LIMIT",c.DAILY_ENTRY_LIMIT);
+console.log("WEB_SYNC="+(c.WEB_AUTO_SYNC===true||c.WEB_AUTO_SYNC===1||c.WEB_AUTO_SYNC==="true"?"1":"0"));
+console.log("WEB_FUNDS="+(c.WEB_SYNC_ALLOW_FUNDS_KEYS===true||c.WEB_SYNC_ALLOW_FUNDS_KEYS===1||c.WEB_SYNC_ALLOW_FUNDS_KEYS==="true"?"1":"0"));
 '@
     $lines = Invoke-NodeJs 'cfg-read' $code
     foreach ($l in $lines) {
@@ -4344,6 +4413,9 @@ console.log("AUTO_UPDATE="+(c.AUTO_UPDATE===true||c.AUTO_UPDATE===1||c.AUTO_UPDA
                 'TRADE_SELL_MODE'   { if ($v -in @('fixed','spotminus')) { $Script:WizSellMode = $v } }
                 'TRADE_SELL_PRICE'  { if (Test-IsNum $v) { $Script:WizSellPrice = $v } }
                 'TRADE_SELL_AMOUNT' { if (Test-IsNum $v) { $Script:WizSellAmount = $v } }
+                'DAILY_ENTRY_LIMIT' { if (Test-IsNum $v) { $Script:WizDailyLimit = $v } }
+                'WEB_SYNC'          { if ($v -eq '1') { $Script:WizWebSync = '1' } else { $Script:WizWebSync = '0' } }
+                'WEB_FUNDS'         { if ($v -eq '1') { $Script:WizWebFunds = '1' } else { $Script:WizWebFunds = '0' } }
                 'APPROVE_MODE'      { if ($v -in @('rounds','usd')) { $Script:WizApproveMode = $v } }
                 'APPROVE_ROUNDS'    { if (Test-IsNum $v) { $Script:WizApproveRounds = $v } }
                 'APPROVE_USD'       { if (Test-IsNum $v) { $Script:WizApproveUsd = $v } }
@@ -4492,6 +4564,50 @@ function Edit-Sell {
     if (Test-IsNum $v) { $Script:WizSellAmount = $v } elseif ($v) { Write-WarnMsg "无效数字，保持原值" }
 }
 
+function Get-DailyText {
+    if ($Script:WizDailyLimit -eq '0' -or [string]::IsNullOrWhiteSpace($Script:WizDailyLimit)) { return '关闭(不限)' }
+    return "每天最多 $($Script:WizDailyLimit) 场(全局)"
+}
+function Edit-Daily {
+    Show-WizHeader
+    Write-Host "    ---- 每日场次限制 ----"
+    Write-Host "      限制每天最多入场多少次，控制成本与风险。默认关闭。"
+    Write-Host "      全局限制在此设置；单个账号可在 [7] 账号管理 里单独设(留空跟随全局)。"
+    Write-Host "      计数按本地日期，存在 entry-counter.json，重启不清零。"
+    Write-Host "    当前: $(Get-DailyText)"
+    $v = Read-Menu "    每天最多多少场 (0=关闭，留空保持)"
+    if ($v) {
+        if ($v -match '^\d+$' -and [int]$v -le 100000) { $Script:WizDailyLimit = $v }
+        else { Write-WarnMsg "需为 0~100000 的整数，保持原值" }
+    }
+    Start-Sleep -Seconds 1
+}
+
+function Get-WebText {
+    $a = '关'; $b = '关'
+    if ($Script:WizWebSync -eq '1') { $a = '开(启动时后台检测)' }
+    if ($Script:WizWebFunds -eq '1') { $b = '开(队列/USDT/市场可写回)' }
+    return "自动同步=$a; 资金字段=$b"
+}
+function Edit-WebSync {
+    Show-WizHeader
+    Write-Host "    ---- 网页合约自动同步 ----"
+    Write-Host "      游戏网页会换合约。开启后从网页自动读取最新合约地址。"
+    Write-Host "      默认关闭；资金字段写回需单独确认。"
+    Write-Host "    当前: $(Get-WebText)"
+    Write-Host "      [1] 开启自动同步    [2] 关闭自动同步"
+    Write-Host "      [3] 允许资金字段写回 [4] 禁止资金字段写回"
+    Write-Host "      [0] 返回"
+    $ch = Read-Menu "    请选择"
+    switch ($ch) {
+        '1' { $Script:WizWebSync = '1'; Write-Ok "已开启自动同步(下次启动生效)" }
+        '2' { $Script:WizWebSync = '0'; Write-Ok "已关闭自动同步" }
+        '3' { $Script:WizWebFunds = '1'; Write-Ok "已允许资金字段写回" }
+        '4' { $Script:WizWebFunds = '0'; Write-Ok "已禁止资金字段写回" }
+    }
+    Start-Sleep -Seconds 1
+}
+
 function Get-ApproveText {
     if ($Script:WizApproveMode -eq 'usd') {
         if ($Script:WizApproveUsd -eq '0') { return '按 U 数: 0 已废弃，将按 1 场票价授权' }
@@ -4562,6 +4678,8 @@ function Show-WizHeader {
     Write-Host "    FTS 买入   : $(Get-BuyText)"
     Write-Host "    FTS 卖出   : $(Get-SellText)"
     Write-Host "    授权额度   : $(Get-ApproveText)"
+    Write-Host "    网页合约   : $(Get-WebText)"
+    Write-Host "    每日场次   : $(Get-DailyText)"
     Write-Host "    自动更新   : $(Get-UpdateText)"
     Write-Host "  ----------------------------------------------------"
 }
@@ -4825,23 +4943,52 @@ function Clear-Accounts {
     Start-Sleep -Seconds 1
 }
 
+function Set-AccountLimits {
+    Show-WizHeader
+    Write-Host "    ---- 单账号每日场次限制 ----"
+    Write-Host "      为每个账号单独设置每天最多入场多少场。"
+    Write-Host "      输入 0 = 该账号不限制；留空 = 跟随全局设置。"
+    Write-Host "      当前全局: $(Get-DailyText)"
+    $code = @'
+const fs=require("fs");
+try{const d=JSON.parse(fs.readFileSync("wallets.json","utf8"));d.wallets.forEach((w,i)=>console.log(i+"|"+w.ADDRESS+"|"+(w.DAILY_ENTRY_LIMIT===undefined?"":w.DAILY_ENTRY_LIMIT)));}catch(e){}
+'@
+    $lines = Invoke-NodeJs 'acc-limits' $code
+    if (-not $lines -or $lines.Count -eq 0) { Write-Host "    (还没有账号)"; Start-Sleep -Seconds 1; return }
+    foreach ($l in $lines) {
+        $p = "$l".Split('|')
+        if ($p.Count -lt 2) { continue }
+        $idx = $p[0]; $addr = $p[1]; $cur = if ($p.Count -gt 2) { $p[2] } else { '' }
+        $hint = if ($cur) { $cur } else { '跟随全局' }
+        $v = Read-Menu "    [$([int]$idx + 1)] $addr  上限 [$hint]"
+        if ($v -match '^\d+$') {
+            $wc = 'try{const fs=require("fs");const d=JSON.parse(fs.readFileSync("wallets.json","utf8"));d.wallets[' + $idx + '].DAILY_ENTRY_LIMIT=Number("' + $v + '");const t="wallets.json.tmp";fs.writeFileSync(t,JSON.stringify(d,null,2),{mode:0o600});try{fs.renameSync(t,"wallets.json")}finally{if(fs.existsSync(t))try{fs.unlinkSync(t)}catch(e){}}}catch(e){console.error(e.message);process.exit(1)}'
+            $null = Invoke-NodeJs 'acc-limit-set' $wc
+            if ($Script:LastNodeExit -ne 0) { Write-WarnMsg "写入失败" }
+        } elseif ($v) { Write-WarnMsg "需为整数，跳过" }
+    }
+    Write-Ok "单账号场次限制已更新"
+    Start-Sleep -Seconds 1
+}
+
 function Show-Accounts {
     while ($true) {
         Show-WizHeader
         Write-Host "    ---- 账号管理 ----"
         if (Test-Path -LiteralPath 'wallets.json') {
-            $code = 'try{const d=JSON.parse(require("fs").readFileSync("wallets.json","utf8"));if(!d.wallets.length)console.log("    (还没有账号)");d.wallets.forEach((w,i)=>console.log("    ["+(i+1)+"] "+w.ADDRESS+"   推荐人 "+w.REFERRER));}catch(e){console.log("    (还没有账号)")}'
+            $code = 'try{const d=JSON.parse(require("fs").readFileSync("wallets.json","utf8"));if(!d.wallets.length)console.log("    (还没有账号)");d.wallets.forEach((w,i)=>console.log("    ["+(i+1)+"] "+w.ADDRESS+"   推荐人 "+w.REFERRER+"   场次 "+(w.DAILY_ENTRY_LIMIT===undefined?"跟随全局":w.DAILY_ENTRY_LIMIT)));}catch(e){console.log("    (还没有账号)")}'
             $lines = Invoke-NodeJs 'acc-list' $code
             foreach ($l in $lines) { Write-Host "$l" }
         } else {
             Write-Host "    (还没有账号)"
         }
         Write-Host "    ------------------------------------------------"
-        Write-Host "      [1] 添加账号    [2] 清空重录    [0] 返回"
+        Write-Host "      [1] 添加账号    [2] 清空重录    [3] 场次限制    [0] 返回"
         $ch = Read-Menu "    请选择"
         switch ($ch) {
             '1' { Add-Account }
             '2' { Clear-Accounts }
+            '3' { Set-AccountLimits }
             default { return }
         }
     }
@@ -4858,6 +5005,8 @@ function Reset-Defaults {
         $Script:WizBuyOn = '0'; $Script:WizBuyMaxPrice = ''; $Script:WizBuyMaxTotal = ''
         $Script:WizSellOn = '0'; $Script:WizSellMode = 'fixed'; $Script:WizSellPrice = ''; $Script:WizSellAmount = ''
         $Script:WizApproveMode = 'rounds'; $Script:WizApproveRounds = '1'; $Script:WizApproveUsd = ''
+$Script:WizWebSync = '0'; $Script:WizWebFunds = '0'
+$Script:WizDailyLimit = '0'
         Write-Ok "已恢复默认(尚未保存)"
     } else {
         Write-Host "    已取消"
@@ -4896,6 +5045,9 @@ function Save-Wiz {
     $env:WIZ_APPROVE_USD = $Script:WizApproveUsd
     $env:WIZ_UPDATE_TOKEN = $Script:WizUpdateToken
     $env:WIZ_AUTO_UPDATE = $Script:WizAutoUpdate
+    $env:WIZ_WEB_SYNC = $Script:WizWebSync
+    $env:WIZ_DAILY_LIMIT = $Script:WizDailyLimit
+    $env:WIZ_WEB_FUNDS = $Script:WizWebFunds
 
     $code = @'
 const fs=require("fs");
@@ -4922,8 +5074,9 @@ c.FLEX_FUND_AGGREGATION=c.FLEX_DECISION;
 c.UPDATE_TOKEN=String(e.WIZ_UPDATE_TOKEN||"").trim();
 // v1.7.1: 自动更新开关与 token 解绑 —— 公开仓库没有 token 也照样能检查更新
 c.AUTO_UPDATE=String(e.WIZ_AUTO_UPDATE)==="1";
-c.WEB_AUTO_SYNC=false;                // 网页合约自动同步默认关闭
-c.WEB_SYNC_ALLOW_FUNDS_KEYS=false;    // 资金相关字段默认冻结
+c.DAILY_ENTRY_LIMIT=Math.max(0,Math.floor(Number(e.WIZ_DAILY_LIMIT||0)));
+c.WEB_AUTO_SYNC=String(e.WIZ_WEB_SYNC)==="1";             // 网页合约自动同步，默认关
+c.WEB_SYNC_ALLOW_FUNDS_KEYS=String(e.WIZ_WEB_FUNDS)==="1"; // 资金字段写回，默认关
 // FTS 自动买卖: 开关默认关；阈值只在用户填了才写入(不设默认值)
 c.TRADE_BUY_ENABLED=String(e.WIZ_BUY_ON)==="1";
 if(String(e.WIZ_BUY_MAX_PRICE||"").trim()!=="")c.TRADE_BUY_MAX_PRICE=Number(e.WIZ_BUY_MAX_PRICE);else delete c.TRADE_BUY_MAX_PRICE;
@@ -4945,7 +5098,7 @@ try { fs.renameSync(tmp,"config.json"); } finally { if (fs.existsSync(tmp)) { tr
 '@
     $null = Invoke-NodeJs 'cfg-write' $code
     $rc = $Script:LastNodeExit
-    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_MINER_MODE','WIZ_CLAIM_WIN','WIZ_FLEX','WIZ_BUY_ON','WIZ_BUY_MAX_PRICE','WIZ_BUY_MAX_TOTAL','WIZ_SELL_ON','WIZ_SELL_MODE','WIZ_SELL_PRICE','WIZ_SELL_AMOUNT','WIZ_APPROVE_MODE','WIZ_APPROVE_ROUNDS','WIZ_APPROVE_USD','WIZ_UPDATE_TOKEN','WIZ_AUTO_UPDATE') {
+    foreach ($k in 'WIZ_ROOMS','WIZ_MIN','WIZ_MAX','WIZ_DELAY','WIZ_GAS_MODE','WIZ_GAS_FIXED','WIZ_GAS_MAX','WIZ_GAS_MULT','WIZ_CLAIM','WIZ_BNB','WIZ_MINER','WIZ_MINER_USD','WIZ_MINER_MODE','WIZ_CLAIM_WIN','WIZ_FLEX','WIZ_BUY_ON','WIZ_BUY_MAX_PRICE','WIZ_BUY_MAX_TOTAL','WIZ_SELL_ON','WIZ_SELL_MODE','WIZ_SELL_PRICE','WIZ_SELL_AMOUNT','WIZ_APPROVE_MODE','WIZ_APPROVE_ROUNDS','WIZ_APPROVE_USD','WIZ_UPDATE_TOKEN','WIZ_AUTO_UPDATE','WIZ_WEB_SYNC','WIZ_WEB_FUNDS','WIZ_DAILY_LIMIT') {
         Remove-Item "Env:$k" -ErrorAction SilentlyContinue
     }
     if ($rc -ne 0) { Write-WarnMsg "写入 config.json 失败"; Start-Sleep -Seconds 1; return $false }
@@ -4990,7 +5143,8 @@ function Invoke-Wizard {
         Write-Host "      [9] 中奖处理/组矿机   [10] 自动更新开关 / Token"
         Write-Host "      [11] 灵活资金决策     [12] 保存并退出"
         Write-Host "      [13] FTS自动买入      [14] FTS自动卖出"
-        Write-Host "      [15] 授权额度"
+        Write-Host "      [15] 授权额度       [16] 网页合约同步"
+        Write-Host "      [17] 每日场次限制"
         Write-Host "      [0] 不保存退出"
         Write-Host "  ----------------------------------------------------"
         $ch = Read-Menu "    请选择"
@@ -5009,6 +5163,8 @@ function Invoke-Wizard {
             '13' { Edit-Buy }
             '14' { Edit-Sell }
             '15' { Edit-Approve }
+            '16' { Edit-WebSync }
+            '17' { Edit-Daily }
             '12' { if (Save-Wiz) { return $true } }
             '0' { Write-Host ""; Write-Host "  已退出，未做任何修改"; return $false }
         }
@@ -5039,12 +5195,17 @@ const fs=require("fs");
 let d;
 try{d=JSON.parse(fs.readFileSync("wallets.json","utf8"))}
 catch(e){console.error("wallets.json 不是合法的 JSON: "+e.message);process.exit(1)}
+// 加密钱包没有明文 wallets 字段: 交给 core.js 用 FTS_WALLET_PASSWORD 解密后再校验
+if(d&&d.encrypted===true){
+  if(!process.env.FTS_WALLET_PASSWORD){console.error("wallets.json 已加密，但未设置 FTS_WALLET_PASSWORD，引擎将无法解密");process.exit(1)}
+  console.log("钱包已加密，账号校验交由引擎解密后进行");process.exit(0)
+}
 if(!d||!Array.isArray(d.wallets)||d.wallets.length===0){console.error("wallets.json 中没有账号");process.exit(1)}
 console.log("已加载 "+d.wallets.length+" 个账号配置");
 '@
 $vout = Invoke-NodeJs 'wallet-check' $vcode
 foreach ($l in $vout) { Write-Host "$l" }
-if ($Script:LastNodeExit -ne 0) { Write-Die "wallets.json 无效或为空，请执行: powershell -ExecutionPolicy Bypass -File autofts.ps1 --init" }
+if ($Script:LastNodeExit -ne 0) { Write-Die "wallets.json 无效/无账号，请执行 --init；加密钱包请设置 FTS_WALLET_PASSWORD" }
 
 # ============================================================
 if ($Mode -eq 'selftest') {

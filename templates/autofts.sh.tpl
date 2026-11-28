@@ -350,6 +350,9 @@ WIZ_BUY_ON="0"; WIZ_BUY_MAX_PRICE=""; WIZ_BUY_MAX_TOTAL=""
 WIZ_SELL_ON="0"; WIZ_SELL_MODE="fixed"; WIZ_SELL_PRICE=""; WIZ_SELL_AMOUNT=""
 # 授权额度: mode=rounds(按场数) / usd(按U数)
 WIZ_APPROVE_MODE="rounds"; WIZ_APPROVE_ROUNDS="1"; WIZ_APPROVE_USD=""
+# 网页合约同步(默认关)；资金字段写回需显式开启
+WIZ_WEB_SYNC="0"; WIZ_WEB_FUNDS="0"
+WIZ_DAILY_LIMIT="0"
 
 # ---- 读现有 config.json 作为默认值 ----
 wiz_load() {
@@ -388,6 +391,9 @@ wiz_load() {
       TRADE_SELL_MODE)  case "$v" in fixed|spotminus) WIZ_SELL_MODE="$v" ;; esac ;;
       TRADE_SELL_PRICE) WIZ_SELL_PRICE="$v" ;;
       TRADE_SELL_AMOUNT) WIZ_SELL_AMOUNT="$v" ;;
+      DAILY_ENTRY_LIMIT) WIZ_DAILY_LIMIT="$v" ;;
+      WEB_SYNC)         case "$v" in 1) WIZ_WEB_SYNC="1" ;; *) WIZ_WEB_SYNC="0" ;; esac ;;
+      WEB_FUNDS)        case "$v" in 1) WIZ_WEB_FUNDS="1" ;; *) WIZ_WEB_FUNDS="0" ;; esac ;;
       APPROVE_MODE)     case "$v" in rounds|usd) WIZ_APPROVE_MODE="$v" ;; esac ;;
       APPROVE_ROUNDS)   WIZ_APPROVE_ROUNDS="$v" ;;
       APPROVE_USD)      WIZ_APPROVE_USD="$v" ;;
@@ -422,6 +428,9 @@ wiz_load() {
     if(c.APPROVE_USD!==undefined&&c.APPROVE_USD!==null){console.log("APPROVE_MODE=usd");put("APPROVE_USD",c.APPROVE_USD);}
     else{console.log("APPROVE_MODE=rounds");put("APPROVE_ROUNDS",c.APPROVE_ROUNDS);}
     console.log("AUTO_UPDATE="+(c.AUTO_UPDATE===true||c.AUTO_UPDATE===1||c.AUTO_UPDATE==="true"?"1":"0"));
+    put("DAILY_ENTRY_LIMIT",c.DAILY_ENTRY_LIMIT);
+    console.log("WEB_SYNC="+(c.WEB_AUTO_SYNC===true||c.WEB_AUTO_SYNC===1||c.WEB_AUTO_SYNC==="true"?"1":"0"));
+    console.log("WEB_FUNDS="+(c.WEB_SYNC_ALLOW_FUNDS_KEYS===true||c.WEB_SYNC_ALLOW_FUNDS_KEYS===1||c.WEB_SYNC_ALLOW_FUNDS_KEYS==="true"?"1":"0"));
   ' 2>/dev/null)
   # 兼容旧配置里 CLAIM_INTERVAL_MS 直接是毫秒
   [ -n "$WIZ_CLAIM" ] || WIZ_CLAIM=20
@@ -502,6 +511,8 @@ wiz_header() {
   echo "    FTS 买入   : $(wiz_buy_text)"
   echo "    FTS 卖出   : $(wiz_sell_text)"
   echo "    授权额度   : $(wiz_approve_text)"
+  echo "    网页合约   : $(wiz_web_text)"
+  echo "    每日场次   : $(wiz_daily_text)"
   echo "    自动更新   : $(wiz_update_text)"
   echo "  ────────────────────────────────────────────────────"
 }
@@ -793,6 +804,81 @@ wiz_edit_approve() {
   sleep 1
 }
 
+wiz_web_text() {
+  local a="关" b="关"
+  [ "$WIZ_WEB_SYNC" = "1" ] && a="开(启动时后台检测)"
+  [ "$WIZ_WEB_FUNDS" = "1" ] && b="开(队列/USDT/市场可写回)"
+  echo "自动同步=$a; 资金字段=$b"
+}
+
+wiz_edit_web() {
+  local ch
+  wiz_header
+  echo "    ---- 网页合约自动同步 ----"
+  echo "      游戏网页会换合约。开启后从网页自动读取最新合约地址。"
+  echo "      默认关闭；开启后仍建议资金字段单独确认。"
+  echo "    当前: $(wiz_web_text)"
+  echo "      [1] 开启自动同步    [2] 关闭自动同步"
+  echo "      [3] 允许资金字段写回 [4] 禁止资金字段写回"
+  echo "      [0] 返回"
+  read -r -p "    请选择: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  case "$ch" in
+    1) WIZ_WEB_SYNC="1"; echo "  已开启自动同步(下次启动生效)" ;;
+    2) WIZ_WEB_SYNC="0"; echo "  已关闭自动同步" ;;
+    3) WIZ_WEB_FUNDS="1"; echo "  已允许资金字段写回(网页换队列/USDT/市场合约时会自动更新)" ;;
+    4) WIZ_WEB_FUNDS="0"; echo "  已禁止资金字段写回" ;;
+  esac
+  sleep 1
+}
+
+wiz_daily_text() {
+  if [ "$WIZ_DAILY_LIMIT" = "0" ] || [ -z "$WIZ_DAILY_LIMIT" ]; then echo "关闭(不限)"; else echo "每天最多 ${WIZ_DAILY_LIMIT} 场(全局)"; fi
+}
+
+wiz_edit_daily() {
+  local v
+  wiz_header
+  echo "    ---- 每日场次限制 ----"
+  echo "      限制每天最多入场多少次，控制成本与风险。默认关闭。"
+  echo "      全局限制在此设置；单个账号可在 [7] 账号管理 里单独设(留空跟随全局)。"
+  echo "      计数按本地日期，存在 entry-counter.json，重启不清零。"
+  echo "    当前: $(wiz_daily_text)"
+  read -r -p "    每天最多多少场 (0=关闭，留空保持): " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
+  if [ -n "$v" ]; then
+    if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -le 100000 ]; then WIZ_DAILY_LIMIT="$v"; else warn_msg "需为 0~100000 的整数，保持原值"; fi
+  fi
+  sleep 1
+}
+
+wiz_edit_account_limit() {
+  local i n addr lim v
+  wiz_header
+  echo "    ---- 单账号每日场次限制 ----"
+  echo "      为每个账号单独设置每天最多入场多少场。"
+  echo "      输入 0 = 该账号不限制；留空 = 跟随全局设置。"
+  echo "      当前全局: $(wiz_daily_text)"
+  n=$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync("wallets.json","utf8")).wallets.length)}catch(e){console.log(0)}' 2>/dev/null)
+  if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -eq 0 ]; then echo "    (还没有账号，先添加账号)"; sleep 1; return; fi
+  for ((i=0;i<n;i++)); do
+    addr=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('wallets.json','utf8')).wallets[$i].ADDRESS)}catch(e){console.log('')}" 2>/dev/null)
+    lim=$(node -e "try{const v=JSON.parse(require('fs').readFileSync('wallets.json','utf8')).wallets[$i].DAILY_ENTRY_LIMIT;console.log(v===undefined?'':v)}catch(e){console.log('')}" 2>/dev/null)
+    echo "    [$((i+1))] ${addr}"
+    read -r -p "         每账号场次上限 [当前:${lim:-跟随全局}]: " v || { echo; die "输入已结束(EOF)，配置向导退出"; }
+    if [ -n "$v" ]; then
+      if [[ "$v" =~ ^[0-9]+$ ]]; then
+        node -e "
+          const fs=require('fs');const d=JSON.parse(fs.readFileSync('wallets.json','utf8'));
+          d.wallets[$i].DAILY_ENTRY_LIMIT=Number('$v');
+          const t='wallets.json.tmp';fs.writeFileSync(t,JSON.stringify(d,null,2),{mode:0o600});
+          try{fs.renameSync(t,'wallets.json')}finally{if(fs.existsSync(t))try{fs.unlinkSync(t)}catch(e){}}
+        " || warn_msg "写入失败"
+      else warn_msg "需为整数，跳过"; fi
+    fi
+  done
+  ok_msg "单账号场次限制已更新"
+  sleep 1
+}
+
 # ---- 推荐人自动检测(读链上 referrerOfV2) ----
 detect_referrer() {
   printf '%s' "$1" | node -e '
@@ -904,15 +990,16 @@ wiz_accounts() {
       try {
         const d = JSON.parse(require("fs").readFileSync("wallets.json","utf8"));
         if (!d.wallets.length) console.log("    (还没有账号)");
-        d.wallets.forEach((w,i)=>console.log("    ["+(i+1)+"] "+w.ADDRESS+"   推荐人 "+w.REFERRER));
+        d.wallets.forEach((w,i)=>console.log("    ["+(i+1)+"] "+w.ADDRESS+"   推荐人 "+w.REFERRER+"   场次限制 "+(w.DAILY_ENTRY_LIMIT===undefined?"跟随全局":w.DAILY_ENTRY_LIMIT)));
       } catch(e) { console.log("    (还没有账号)"); }
     ' 2>/dev/null
     echo "    ────────────────────────────────────────────────"
-    echo "      [1] 添加账号    [2] 清空重录    [0] 返回"
+    echo "      [1] 添加账号    [2] 清空重录    [3] 场次限制    [0] 返回"
     read -r -p "    请选择: " ch || { echo; die "输入已结束(EOF)，配置向导退出"; }
     case "$ch" in
       1) wiz_add_account ;;
       2) wiz_clear_accounts ;;
+      3) wiz_edit_account_limit ;;
       0) return ;;
     esac
   done
@@ -931,6 +1018,8 @@ wiz_defaults() {
       WIZ_BUY_ON="0"; WIZ_BUY_MAX_PRICE=""; WIZ_BUY_MAX_TOTAL=""
       WIZ_SELL_ON="0"; WIZ_SELL_MODE="fixed"; WIZ_SELL_PRICE=""; WIZ_SELL_AMOUNT=""
       WIZ_APPROVE_MODE="rounds"; WIZ_APPROVE_ROUNDS="1"; WIZ_APPROVE_USD=""
+      WIZ_WEB_SYNC="0"; WIZ_WEB_FUNDS="0"
+      WIZ_DAILY_LIMIT="0"
       ok_msg "已恢复默认(尚未保存)" ;;
     *) echo "    已取消" ;;
   esac
@@ -953,6 +1042,7 @@ wiz_commit() {
   WIZ_SELL_ON="$WIZ_SELL_ON" WIZ_SELL_MODE="$WIZ_SELL_MODE" WIZ_SELL_PRICE="$WIZ_SELL_PRICE" WIZ_SELL_AMOUNT="$WIZ_SELL_AMOUNT" \
   WIZ_APPROVE_MODE="$WIZ_APPROVE_MODE" WIZ_APPROVE_ROUNDS="$WIZ_APPROVE_ROUNDS" WIZ_APPROVE_USD="$WIZ_APPROVE_USD" \
   WIZ_UPDATE_TOKEN="$WIZ_UPDATE_TOKEN" WIZ_AUTO_UPDATE="$WIZ_AUTO_UPDATE" \
+  WIZ_WEB_SYNC="$WIZ_WEB_SYNC" WIZ_WEB_FUNDS="$WIZ_WEB_FUNDS" WIZ_DAILY_LIMIT="$WIZ_DAILY_LIMIT" \
   node -e '
     const fs = require("fs");
     let c = {};
@@ -979,8 +1069,9 @@ wiz_commit() {
     c.UPDATE_TOKEN = String(e.WIZ_UPDATE_TOKEN || "").trim();
     // v1.7.1: 自动更新开关与 token 解绑 —— 公开仓库没有 token 也照样能检查更新
     c.AUTO_UPDATE = String(e.WIZ_AUTO_UPDATE) === "1";
-    c.WEB_AUTO_SYNC = false;                // 网页合约自动同步默认关闭
-    c.WEB_SYNC_ALLOW_FUNDS_KEYS = false;    // 资金相关字段默认冻结
+    c.DAILY_ENTRY_LIMIT = Math.max(0, Math.floor(Number(e.WIZ_DAILY_LIMIT || 0)));
+    c.WEB_AUTO_SYNC = String(e.WIZ_WEB_SYNC) === "1";             // 网页合约自动同步，默认关，用户可在 [16] 开
+    c.WEB_SYNC_ALLOW_FUNDS_KEYS = String(e.WIZ_WEB_FUNDS) === "1"; // 资金字段写回，默认关，需用户显式开
     // FTS 自动买卖: 开关默认关；阈值只在用户填了才写入(不设默认值)
     c.TRADE_BUY_ENABLED = String(e.WIZ_BUY_ON) === "1";
     if (String(e.WIZ_BUY_MAX_PRICE || "").trim() !== "") c.TRADE_BUY_MAX_PRICE = Number(e.WIZ_BUY_MAX_PRICE);
@@ -1046,7 +1137,8 @@ wiz_menu() {
   echo "      [9] 中奖处理/组矿机   [10] 自动更新开关 / Token"
   echo "      [11] 灵活资金决策     [12] 保存并退出"
   echo "      [13] FTS自动买入      [14] FTS自动卖出"
-  echo "      [15] 授权额度"
+  echo "      [15] 授权额度       [16] 网页合约同步"
+  echo "      [17] 每日场次限制"
   echo "      [0] 不保存退出"
   echo "  ────────────────────────────────────────────────────"
 }
@@ -1073,6 +1165,8 @@ wizard_main() {
       13) wiz_edit_buy ;;
       14) wiz_edit_sell ;;
       15) wiz_edit_approve ;;
+      16) wiz_edit_web ;;
+      17) wiz_edit_daily ;;
       12) if wiz_commit; then return 0; fi ;;
       0) echo ""; echo "  已退出，未做任何修改"; return 1 ;;
       *) ;;
@@ -1105,9 +1199,19 @@ node -e '
   let d;
   try { d = JSON.parse(fs.readFileSync("wallets.json","utf8")); }
   catch (e) { console.error("wallets.json 不是合法的 JSON: " + e.message); process.exit(1); }
+  // 加密钱包没有明文 wallets 字段: 外壳无法在这里数账号，交给 core.js 用
+  // FTS_WALLET_PASSWORD 解密后再做同样的校验，别在这里 die 掉。
+  if (d && d.encrypted === true) {
+    if (!process.env.FTS_WALLET_PASSWORD) {
+      console.error("wallets.json 已加密，但未设置 FTS_WALLET_PASSWORD，引擎将无法解密");
+      process.exit(1);
+    }
+    console.log("钱包已加密，账号校验交由引擎解密后进行");
+    process.exit(0);
+  }
   if(!d || !Array.isArray(d.wallets) || d.wallets.length===0){ console.error("wallets.json 中没有账号"); process.exit(1); }
   console.log(`已加载 ${d.wallets.length} 个账号配置`);
-' || die "wallets.json 无效或为空，请执行: bash autofts.sh --init"
+' || die "wallets.json 无效/无账号，请执行 --init；加密钱包请设置 FTS_WALLET_PASSWORD"
 
 # ==============================================================
 echo -e "\e[33m[4/5] 设备保活...\e[0m"

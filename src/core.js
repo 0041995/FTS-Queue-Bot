@@ -31,8 +31,8 @@ const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
 // v1.7.1: 引擎日志版本与发行包版本统一，不再出现两套互不相同的版本号。
-// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.0。
-const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.0';
+// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.1。
+const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.1';
 const VERSION = APP_VERSION;
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
@@ -175,6 +175,9 @@ const CFG = {
   APPROVE_ROUNDS: cfgNum(process.env.FTS_APPROVE_ROUNDS ?? userCfg.APPROVE_ROUNDS, 1, 'APPROVE_ROUNDS'),
   APPROVE_MAX_ROUNDS: cfgNum(process.env.FTS_APPROVE_MAX_ROUNDS ?? userCfg.APPROVE_MAX_ROUNDS, 3, 'APPROVE_MAX_ROUNDS'),
   APPROVE_MAX_USD: cfgNum(process.env.FTS_APPROVE_MAX_USD ?? userCfg.APPROVE_MAX_USD, 100, 'APPROVE_MAX_USD'),
+  // 每日场次限制: 每天最多入场多少次。0=关闭(默认)。账号可在 wallets.json 里用
+  // DAILY_ENTRY_LIMIT 单独设(覆盖全局)。计数按本地日期，持久化到 entry-counter.json，重启不清零。
+  DAILY_ENTRY_LIMIT: cfgNum(process.env.FTS_DAILY_ENTRY_LIMIT ?? userCfg.DAILY_ENTRY_LIMIT, 0, 'DAILY_ENTRY_LIMIT'),
   // 中奖后是否自动领取矿机额度(claimWin)。中奖与否由 Chainlink VRF 随机决定，脚本无法干预。
   CLAIM_WIN: (() => {
     const raw = process.env.FTS_CLAIM_WIN ?? userCfg.CLAIM_WIN;
@@ -1855,6 +1858,59 @@ async function drainPending(inst) {
   }
 }
 
+// ---------------- 每日场次限制 ----------------
+// 计数持久化到 entry-counter.json，按本地日期切天，重启不清零。
+// 全局 DAILY_ENTRY_LIMIT 限制所有账号总和；账号 conf.DAILY_ENTRY_LIMIT 单独限制该账号(0=不额外限制)。
+const ENTRY_COUNTER_FILE = path.join(ROOT, 'entry-counter.json');
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function readEntryCounter() {
+  const today = todayKey();
+  try {
+    const o = JSON.parse(fs.readFileSync(ENTRY_COUNTER_FILE, 'utf8'));
+    if (o && o.date === today && typeof o.total === 'number' && o.accounts && typeof o.accounts === 'object') return o;
+  } catch (e) { /* 文件不存在/损坏 -> 从零开始 */ }
+  return { date: today, total: 0, accounts: {} };
+}
+function writeEntryCounter(c) {
+  const tmp = ENTRY_COUNTER_FILE + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(c));
+    fs.renameSync(tmp, ENTRY_COUNTER_FILE);
+  } catch (e) {
+    // 写失败不能影响抢单，但不能让计数丢失导致超限 -> 至少在内存里记住
+    warnOnce('SYS', '每日场次计数写入失败: ' + formatError(e).slice(0, 100), 60000);
+    try { fs.unlinkSync(tmp); } catch (e2) { }
+  }
+}
+// 返回 {allowed, reason, used, limit}；两个限制都关时直接放行，零开销。
+function checkEntryLimit(inst) {
+  const global = Math.max(0, Math.floor(Number(CFG.DAILY_ENTRY_LIMIT) || 0));
+  const acct = inst && inst.conf && inst.conf.DAILY_ENTRY_LIMIT !== undefined
+    ? Math.max(0, Math.floor(Number(inst.conf.DAILY_ENTRY_LIMIT) || 0)) : 0;
+  if (global <= 0 && acct <= 0) return { allowed: true, global: 0, acct: 0 };
+  const c = readEntryCounter();
+  const aUsed = inst ? (c.accounts[inst.address] || 0) : 0;
+  if (global > 0 && c.total >= global) {
+    return { allowed: false, reason: `全局每日 ${global} 场已用完(今日 ${c.total})`, used: c.total, limit: global };
+  }
+  if (acct > 0 && aUsed >= acct) {
+    return { allowed: false, reason: `本账号每日 ${acct} 场已用完(今日 ${aUsed})`, used: aUsed, limit: acct };
+  }
+  return { allowed: true, global, acct, used: c.total, aUsed };
+}
+// 入场成功后调用(确认 status=1)；写入失败也不阻断，仅告警。
+function recordEntry(inst) {
+  if (DRY_RUN) return null;   // 演练不上链，不计入真实场次
+  const c = readEntryCounter();
+  c.total = (c.total || 0) + 1;
+  if (inst && inst.address) c.accounts[inst.address] = (c.accounts[inst.address] || 0) + 1;
+  writeEntryCounter(c);
+  return c;
+}
+
 // ---------------- 抢单 ----------------
 async function snipeWithState(inst, rooms) {
   if (!inst || inst.busy) return;
@@ -1882,6 +1938,13 @@ async function snipeWithState(inst, rooms) {
 
       if (!(await ensureFunds(inst, st.ticketPrice, room))) { continue; }
 
+      // 每日场次限制: 在发交易前拦截，避免超限后还白烧 gas
+      const lim = checkEntryLimit(inst);
+      if (!lim.allowed) {
+        warnOnce(inst.address, `[${tag}] 跳过入场: ${lim.reason}`, 300000);
+        continue;
+      }
+
       inst.acted.add(key);
       const okTx = await sendTx(inst, {
         label: `[${tag}] 入场(当前 ${count} 人, 轮次 ${st.rId})`,
@@ -1889,7 +1952,8 @@ async function snipeWithState(inst, rooms) {
         method: 'enterQueue',
         args: [room, inst.referrer]
       });
-      if (!okTx) inst.acted.delete(key); // 失败允许重试
+      if (okTx) recordEntry(inst);       // 确认上链成功才计场次
+      else inst.acted.delete(key);       // 失败允许重试
     }
   } catch (e) {
     err(inst.address, '抢单流程异常: ' + formatError(e));
