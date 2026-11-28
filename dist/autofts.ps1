@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 <#
-    FTS 多账号自动打金脚本 - Windows 版 v1.8.3
+    FTS 多账号自动打金脚本 - Windows 版 v1.8.4
     同一个文件同时兼容 PowerShell 5.1 (Desktop) 与 PowerShell 7 (Core)
 
     用法:
@@ -252,7 +252,7 @@ $DoWizard  = $false
 $ProbeArgs = @()
 
 $Script:OrigArgs = @($args)
-$env:FTS_APP_VERSION = '1.8.3'
+$env:FTS_APP_VERSION = '1.8.4'
 for ($i = 0; $i -lt $args.Count; $i++) {
     $a = [string]$args[$i]
     if ($a -eq '--probe') {
@@ -343,14 +343,21 @@ function Install-Deps {
     $npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
     if (-not $npmCmd) { $npmCmd = Get-Command npm -ErrorAction SilentlyContinue }
     if (-not $npmCmd) { Write-Die "未找到 npm，请重装 Node.js" }
-    foreach ($reg in $Script:NpmRegistries) {
+    # CI=1 + npm_config_yes=true + --yes 三保险: 杜绝任何交互式 y/n 提示卡住自动化
+    $oldCI = $env:CI; $oldYes = $env:npm_config_yes
+    $env:CI = '1'; $env:npm_config_yes = 'true'
+    try {
+      foreach ($reg in $Script:NpmRegistries) {
         Write-Host "  尝试镜像: $reg"
         for ($t = 1; $t -le 2; $t++) {
-            & $npmCmd.Source install --registry="$reg" --no-audit --no-fund --ignore-scripts --fetch-retries=1 --fetch-timeout=30000 2>&1 | Out-Null
+            & $npmCmd.Source install --yes --registry="$reg" --no-audit --no-fund --ignore-scripts --fetch-retries=1 --fetch-timeout=30000 2>&1 | Out-Null
             if (Test-DepsOk) { Write-Ok "依赖安装成功 (镜像 $reg)"; return }
             if ($t -eq 1) { Write-WarnMsg "镜像 $reg 第 $t 次未成功，再试一次..." }
         }
         Write-WarnMsg "镜像 $reg 不可用，切换下一个"
+      }
+    } finally {
+      $env:CI = $oldCI; $env:npm_config_yes = $oldYes
     }
     Write-Die "所有国内镜像均安装失败。请用 --install 参数重试。"
 }
@@ -404,8 +411,8 @@ const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
 // v1.7.1: 引擎日志版本与发行包版本统一，不再出现两套互不相同的版本号。
-// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.3。
-const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.3';
+// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.4。
+const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.4';
 const VERSION = APP_VERSION;
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
@@ -479,20 +486,17 @@ const CFG = {
   HTTP_POOL: process.env.FTS_HTTP_POOL
     ? process.env.FTS_HTTP_POOL.split(',').map(s => s.trim()).filter(Boolean)
     : cfgArr(userCfg.HTTP_POOL, [
-      // 2026-11-27 实测: 42 个候选逐一验证 eth_blockNumber+eth_call+延迟(3次取平均)，筛出下列 11 个优质节点。
-      // Tier A = bnbchain 官方(平均~200ms, 闸门14)；Tier B = 公共节点(平均~500-600ms, 闸门12)。
-      // ninicoin/nodereal/meowrpc/defibit/blockrazor/0.48club 等已剔除(延迟>1.4s 或大量失败)。
-      'https://bsc-dataseed.bnbchain.org',      // A ~199ms
-      'https://bsc-dataseed1.bnbchain.org',     // A ~213ms
-      'https://bsc-dataseed2.bnbchain.org',     // A ~213ms
-      'https://bsc-dataseed3.bnbchain.org',     // A ~228ms
-      'https://bsc-dataseed4.bnbchain.org',     // A ~230ms
-      'https://bsc.rpc.sentio.xyz',             // B ~498ms
-      'https://bsc-mainnet.public.blastapi.io', // B ~538ms
-      'https://bsc-rpc.publicnode.com',         // B ~545ms
-      'https://rpc-bsc.48.club',                // B ~601ms
-      'https://bsc.publicnode.com'              // B ~602ms
-      // pocket.network 单次~484ms 但高并发下频繁 429(实测 30 秒内 10 次)，剔除
+      // 2026-11-28 实测: 官方 dataseed 系列 eth_call 全部超时(8~13s)，已从默认池移除。
+      // 下列节点均实测 eth_call 连续 2 次正常(0.8~2.2s)，按延迟排序。
+      'https://bsc-mainnet.public.blastapi.io', // ~1.1s
+      'https://bsc.meowrpc.com',                // ~1.1s
+      'https://bsc-rpc.publicnode.com',         // ~1.4s
+      'https://rpc-bsc.48.club',                // ~1.5s
+      'https://bsc.rpc.sentio.xyz',             // ~1.6s
+      'https://bsc.publicnode.com'              // ~1.7s
+      // 官方 dataseed/0/1/2/3/4、binance.org、binance.technical.io、bnbchain.world
+      // 实测 eth_call 超时或极不稳定(0.5s~TIMEOUT 反复)，全部剔除。
+      // pocket.network 高并发频繁 429，剔除。
     ], 'HTTP_POOL').map(s => String(s).trim()).filter(Boolean),
   WSS_POOL: process.env.FTS_WSS_POOL
     ? process.env.FTS_WSS_POOL.split(',').map(s => s.trim()).filter(Boolean)
@@ -511,6 +515,8 @@ const CFG = {
   POLL_INTERVAL_MS: cfgNum(process.env.FTS_POLL_MS ?? userCfg.POLL_INTERVAL_MS, 1500, 'POLL_INTERVAL_MS'),
   WS_STALE_MS: cfgNum(process.env.FTS_WS_STALE_MS ?? userCfg.WS_STALE_MS, 45000, 'WS_STALE_MS'),
   RPC_TIMEOUT_MS: cfgNum(process.env.FTS_RPC_TIMEOUT_MS, 12000, 'RPC_TIMEOUT_MS'),
+  // 节点探测专用超时: 比正式 RPC 短，坏节点快速淘汰，不让 rotate/pickBest 卡 12 秒
+  PROBE_TIMEOUT_MS: cfgNum(process.env.FTS_PROBE_TIMEOUT_MS ?? userCfg.PROBE_TIMEOUT_MS, 5000, 'PROBE_TIMEOUT_MS'),
   MAX_RPC_RETRY: cfgNum(process.env.FTS_RPC_RETRY, 3, 'MAX_RPC_RETRY'),
   TX_WAIT_MS: cfgNum(process.env.FTS_TX_WAIT_MS, 90000, 'TX_WAIT_MS'),
   GAS_MULT: cfgNum(process.env.FTS_GAS_MULT, 1.25, 'GAS_MULT'),
@@ -704,7 +710,7 @@ function validateCfg() {
   if (!Number.isInteger(CFG.SNIPE_MIN_COUNT)) { p.push(`抢单人数下限(${CFG.SNIPE_MIN_COUNT}) 必须是整数，已取整为 ${Math.floor(CFG.SNIPE_MIN_COUNT)}`); CFG.SNIPE_MIN_COUNT = Math.floor(CFG.SNIPE_MIN_COUNT); }
   if (!Number.isInteger(CFG.SNIPE_MAX_COUNT)) { p.push(`抢单人数上限(${CFG.SNIPE_MAX_COUNT}) 必须是整数，已取整为 ${Math.ceil(CFG.SNIPE_MAX_COUNT)}`); CFG.SNIPE_MAX_COUNT = Math.ceil(CFG.SNIPE_MAX_COUNT); }
   if (!CFG.ROOMS.length) { p.push('ROOMS 为空，已恢复为 [0,1,2]'); CFG.ROOMS = [0, 1, 2]; }
-  if (!CFG.HTTP_POOL.length) { p.push('HTTP_POOL 为空，已恢复为默认 BSC 节点'); CFG.HTTP_POOL = ['https://bsc-dataseed1.binance.org', 'https://bsc-rpc.publicnode.com']; }
+  if (!CFG.HTTP_POOL.length) { p.push('HTTP_POOL 为空，已恢复为默认 BSC 节点'); CFG.HTTP_POOL = ['https://bsc-mainnet.public.blastapi.io', 'https://bsc-rpc.publicnode.com']; }
   if (CFG.CLAIM_LOOKBACK < 1) { p.push('CLAIM_LOOKBACK 必须 >=1，已改为 1'); CFG.CLAIM_LOOKBACK = 1; }
   if (CFG.GAS_MIN_GWEI > CFG.GAS_MAX_GWEI) { p.push(`GAS_MIN_GWEI(${CFG.GAS_MIN_GWEI}) > GAS_MAX_GWEI(${CFG.GAS_MAX_GWEI})，已对调`); [CFG.GAS_MIN_GWEI, CFG.GAS_MAX_GWEI] = [CFG.GAS_MAX_GWEI, CFG.GAS_MIN_GWEI]; }
   // 固定 gas 高于上限时，capGwei 会把它悄悄压下来，用户会以为设置没生效
@@ -1150,10 +1156,11 @@ class RpcManager {
     const t0 = Date.now();
     try {
       const p = this.makeProvider(url);
-      const h = await withTimeout(p.getBlockNumber(), CFG.RPC_TIMEOUT_MS, 'getBlockNumber');
+      const h = await withTimeout(p.getBlockNumber(), CFG.PROBE_TIMEOUT_MS, 'getBlockNumber');
       // 有些公共节点允许 eth_blockNumber 但屏蔽 eth_call(会报 400 / "eth_call is not supported")，
       // 这种节点会导致预演和余额读取全挂，必须在这里筛掉。
-      const ret = await withTimeout(p.call({ to: CFG.USDT_ADDR, data: '0x313ce567' }), CFG.RPC_TIMEOUT_MS, 'eth_call');
+      // v1.8.4: 探测用短超时(默认5s)，坏节点快速失败；正式调用仍用 RPC_TIMEOUT_MS(12s)。
+      const ret = await withTimeout(p.call({ to: CFG.USDT_ADDR, data: '0x313ce567' }), CFG.PROBE_TIMEOUT_MS, 'eth_call');
       if (!ret || ret === '0x') throw new Error('eth_call 返回空');
       return { url, latency: Date.now() - t0, height: h, ok: true };
     } catch (e) {
@@ -1194,23 +1201,28 @@ class RpcManager {
   }
   async _rotate() {
     const old = this.urls[this.index];
-    // 第一轮优先跳过处于冷却期的节点
+    // v1.8.4: 并行探测所有候选(原来串行逐个等，坏节点 12s 一个要等一串)。
+    // 用 PROBE_TIMEOUT_MS 短超时，整体耗时 = 最慢的一个探测，而不是所有节点之和。
+    // 第一轮排除冷却节点；全灭时第二轮放宽(忽略冷却)再试一次。
     for (let pass = 0; pass < 2; pass++) {
-    for (let i = 1; i <= this.urls.length; i++) {
-      const idx = (this.index + i) % this.urls.length;
-      const left = cooldownLeft(this.urls[idx]);
-      if (pass === 0 && left > 0) continue;   // 冷却中，先试别的
-      const r = await this.probe(this.urls[idx]);
-      if (!r.ok) warnOnce('SYS', `备用节点不可用 ${this.urls[idx]}: ${formatError(r.error)}`, 60000);
-      if (r.ok) {
-        this.index = idx;
-        this.provider = this.makeProvider(this.urls[idx]);
+      const candidates = this.urls
+        .map((u, idx) => ({ u, idx }))
+        .filter(({ u }) => pass === 1 || cooldownLeft(u) <= 0);
+      if (!candidates.length) continue;
+      const rs = await Promise.all(candidates.map(async ({ u, idx }) => ({ ...(await this.probe(u)), idx })));
+      for (const r of rs) {
+        if (!r.ok) warnOnce('SYS', `备用节点不可用 ${r.url}: ${formatError(r.error)}`, 60000);
+      }
+      const good = rs.filter(r => r.ok).sort((a, b) => a.latency - b.latency);
+      if (good.length) {
+        const best = good[0];
+        this.index = best.idx;
+        this.provider = this.makeProvider(best.url);
         this.failStreak = 0;
-        warn('SYS', `已切换节点: ${old} -> ${this.urls[idx]} (${r.latency}ms)`);
+        warn('SYS', `已切换节点: ${old} -> ${best.url} (${best.latency}ms，${good.length} 个可用)`);
         for (const fn of this.listeners) { try { fn(this.provider); } catch (e) { } }
         return true;
       }
-    }
     }
     warn('SYS', '所有节点探测失败(或被限流冷却)，3 秒后重试');
     await sleep(3000);
@@ -2149,6 +2161,15 @@ async function sendTx(inst, opt) {
 let readQueue = null;
 function bindRead(p) { try { readQueue = new ethers.Contract(CFG.QUEUE_ADDR, QUEUE_ABI, p); } catch (e) { } }
 mgr.onRotate(bindRead);
+// selftest 的合约对象也必须跟随主节点轮换重建，否则会一直打已失效的旧节点(实测超时主因)。
+let selftestQueue = null, selftestUsdt = null;
+function bindSelftest(p) {
+  try {
+    selftestQueue = new ethers.Contract(CFG.QUEUE_ADDR, QUEUE_ABI, p);
+    selftestUsdt = new ethers.Contract(CFG.USDT_ADDR, USDT_ABI, p);
+  } catch (e) { }
+}
+mgr.onRotate(bindSelftest);
 
 // ---------------- 出块共享状态缓存 ----------------
 // 同一个区块内，所有房间/所有账号共用一份查询结果 -> 请求量从 O(账号数×房间×3) 降到 O(房间×3)
@@ -2779,23 +2800,27 @@ async function selftest() {
 
   console.log('\n--- 3. 合约方法探测 ---');
   const probe = async (label, fn) => {
-    try { const v = await mgr.rpc(p => withTimeout(fn(), 10000, label)); console.log(`  ✅ ${label}: ${String(v).slice(0, 120)}`); return v; }
-    catch (e) { console.log(`  ❌ ${label}: ${formatError(e)}`); return null; }
+    // 每次重试都用 mgr.rpc 传入的 provider 重绑合约，让换节点真正生效
+    // (原来 fn() 闭包用固化 provider，重试打的都是同一个坏节点)
+    try {
+      const v = await mgr.rpc(p => { bindSelftest(p); return withTimeout(fn(), 10000, label); });
+      console.log(`  ✅ ${label}: ${String(v).slice(0, 120)}`); return v;
+    } catch (e) { console.log(`  ❌ ${label}: ${formatError(e)}`); return null; }
   };
-  const qRead = new ethers.Contract(CFG.QUEUE_ADDR, QUEUE_ABI, mgr.provider);
-  const uRead = new ethers.Contract(CFG.USDT_ADDR, USDT_ABI, mgr.provider);
-  await probe('QUEUE.currentRound(0)', () => qRead.currentRound(0));
-  await probe('QUEUE.roomCount()', () => qRead.roomCount());
+  // 用可随节点轮换重建的合约对象：rotate 后 onRotate 会重绑，避免一直打失效节点
+  bindSelftest(mgr.provider);
+  await probe('QUEUE.currentRound(0)', () => selftestQueue.currentRound(0));
+  await probe('QUEUE.roomCount()', () => selftestQueue.roomCount());
   // 逐个房间体检(0=10U 1=50U 2=100U)，房间不存在/未启用要能一眼看出
   const roomOk = {};
   for (const room of CFG.ROOMS) {
     // 注意: probe 返回的是格式化后的字符串，这里另外取一次原始对象用于判断。
     // 读取失败会重试 3 次，避免一次网络抖动被误判成"房间不存在"
-    await probe(`QUEUE.roomConfigs(${room})`, () => qRead.roomConfigs(room).then(c =>
+    await probe(`QUEUE.roomConfigs(${room})`, () => selftestQueue.roomConfigs(room).then(c =>
       `ticketPrice=${ethers.formatUnits(c.ticketPrice, 18)} max=${c.maxCapacity} winners=${c.winnerCount} enabled=${c.enabled} daily=${c.dailyRoundLimit}/已开${c.todayRounds}`));
     let cfg = null, lastCfgErr = null;
     for (let a = 0; a < 3 && !cfg; a++) {
-      try { cfg = await qRead.roomConfigs(room); } catch (e) { lastCfgErr = e; await sleep(600); }
+      try { cfg = await selftestQueue.roomConfigs(room); } catch (e) { lastCfgErr = e; await sleep(600); }
     }
     if (cfg && cfg.ticketPrice !== undefined && cfg.ticketPrice !== null) {
       const enabled = cfg.enabled;
@@ -2804,12 +2829,12 @@ async function selftest() {
       const expect = { 0: 10, 1: 50, 2: 100 }[room];
       if (expect && price !== expect) console.log(`  ⚠️ 房间${room} 链上票价 ${price}U 与预设 ${expect}U 不符，以链上为准`);
       if (!enabled) console.log(`  ⚠️ 房间${room} 链上标记为停用(enabled=false)，脚本会自动跳过`);
-      await probe(`QUEUE.currentRound(${room})`, () => qRead.currentRound(room));
-      const rid = await qRead.currentRound(room).catch(() => null);
+      await probe(`QUEUE.currentRound(${room})`, () => selftestQueue.currentRound(room));
+      const rid = await selftestQueue.currentRound(room).catch(() => null);
       // currentRound 为 0 表示这个房间还没开过任何一轮，此时查 roundInfo(room,0)
       // 会 revert(ARRAY_RANGE_ERROR)，那是正常的，不该报成 ❌
       if (rid !== null && BigInt(rid) > 0n) {
-        await probe(`QUEUE.roundInfo(${room}, ${rid})`, () => qRead.roundInfo(room, rid).then(i =>
+        await probe(`QUEUE.roundInfo(${room}, ${rid})`, () => selftestQueue.roundInfo(room, rid).then(i =>
           `count=${i.count} state=${i.state} start=${i.startTime} deadline=${i.deadline} winners=${i.winners.length}`));
       } else if (rid !== null) {
         console.log(`  ○ 房间${room} 尚无任何轮次(currentRound=0)，跳过 roundInfo 查询`);
@@ -2827,13 +2852,13 @@ async function selftest() {
   }
   // 队列合约没有 allowance，这是"兼容性探测"，失败才是预期结果，不该报 ❌
   try {
-    await mgr.rpc(p => qRead.allowance(CFG.QUEUE_ADDR, CFG.QUEUE_ADDR));
+    await mgr.rpc(p => selftestQueue.allowance(CFG.QUEUE_ADDR, CFG.QUEUE_ADDR));
     console.log('  ✅ QUEUE.allowance 可调用(意外: 该合约本不该有 allowance)');
   } catch (e) {
     console.log('  ○ QUEUE.allowance 不可调用(符合预期: 授权额度以 USDT 合约为准)');
   }
-  await probe('USDT.decimals', () => uRead.decimals());
-  await probe('USDT.symbol', () => uRead.symbol());
+  await probe('USDT.decimals', () => selftestUsdt.decimals());
+  await probe('USDT.symbol', () => selftestUsdt.symbol());
 
   console.log('\n--- 4. 账号检查 ---');
   // 复用 main 已经加载好的钱包列表，不再重复 loadWallets()(否则校验失败信息会打印两遍)
@@ -2845,7 +2870,7 @@ async function selftest() {
   const roomCfgs = {};
   for (const room of CFG.ROOMS) {
     if (!roomOk[room]) continue;
-    roomCfgs[room] = await qRead.roomConfigs(room).catch(() => null);
+    roomCfgs[room] = await selftestQueue.roomConfigs(room).catch(() => null);
   }
   const minBnb = ethers.parseEther(String(CFG.MIN_BNB_GAS));
   console.log(`  （${wallets.length} 个账号：全部做本地校验，仅第 1 个做链上余额体检，避免几百次 RPC 拖慢自检）`);
@@ -2864,8 +2889,8 @@ async function selftest() {
     try {
       const [bnb, usdt, allow] = await Promise.all([
         mgr.rpc(p => p.getBalance(w.ADDRESS)),
-        mgr.rpc(p => uRead.balanceOf(w.ADDRESS)),
-        mgr.rpc(p => uRead.allowance(w.ADDRESS, CFG.QUEUE_ADDR))
+        mgr.rpc(p => new ethers.Contract(CFG.USDT_ADDR, USDT_ABI, p).balanceOf(w.ADDRESS)),
+        mgr.rpc(p => new ethers.Contract(CFG.USDT_ADDR, USDT_ABI, p).allowance(w.ADDRESS, CFG.QUEUE_ADDR))
       ]);
       lines.push(`   BNB=${ethers.formatEther(bnb)} | USDT=${ethers.formatUnits(usdt, 18)} | 已授权=${ethers.formatUnits(allow, 18)} (单轮授权模式)`);
       if (bnb < minBnb) {
@@ -2928,7 +2953,7 @@ async function selftest() {
   for (const w of wallets.slice(0, PREVIEW_N)) {
     for (const room of CFG.ROOMS) {
       let cfg = null;
-      try { cfg = await mgr.rpc(p => qRead.roomConfigs(room)); } catch (e) { }
+      try { cfg = await mgr.rpc(p => new ethers.Contract(CFG.QUEUE_ADDR, QUEUE_ABI, p).roomConfigs(room)); } catch (e) { }
       if (!cfg || !cfg.ticketPrice) {
         console.log(`  ○ ${short(w.ADDRESS)} 房间${room} 未启用/未配置，跳过预演(运行时也会自动跳过)`);
         continue;
@@ -2939,7 +2964,7 @@ async function selftest() {
       }
       const tag = roomLabel(room, cfg.ticketPrice);
       try {
-        const data = qRead.interface.encodeFunctionData('enterQueue', [room, w.REFERRER]);
+        const data = selftestQueue.interface.encodeFunctionData('enterQueue', [room, w.REFERRER]);
         await mgr.rpc(p => withTimeout(p.call({ to: CFG.QUEUE_ADDR, from: w.ADDRESS, data }), 10000, 'enterQueue.call'));
         console.log(`  ✅ ${short(w.ADDRESS)} [${tag}] enterQueue 预演通过`);
       } catch (e) {
@@ -2957,9 +2982,9 @@ async function selftest() {
     for (const room of CFG.ROOMS) {
       if (roomOk[room] === false) continue;
       try {
-        const rId = Number(await mgr.rpc(p => qRead.currentRound(room)));
+        const rId = Number(await mgr.rpc(p => selftestQueue.currentRound(room)));
         if (rId <= 0) continue;
-        const data = qRead.interface.encodeFunctionData('claimRefundAndAirdrop', [room, rId - 1]);
+        const data = selftestQueue.interface.encodeFunctionData('claimRefundAndAirdrop', [room, rId - 1]);
         await mgr.rpc(p => withTimeout(p.call({ to: CFG.QUEUE_ADDR, from: w.ADDRESS, data }), 10000, 'claim.call'));
         console.log(`  ✅ ${short(w.ADDRESS)} [房间${room}] claimRefundAndAirdrop 预演通过`);
       } catch (e) {
@@ -4347,7 +4372,7 @@ if ($Mode -eq 'probe') {
 # --update: 原地替换脚本（私有仓库需在 config.json 写 UPDATE_TOKEN）
 if ($Mode -eq 'update') {
     Write-Host ""
-    & $Script:NodeExe update.js --apply --current="1.8.3" --asset=autofts.ps1
+    & $Script:NodeExe update.js --apply --current="1.8.4" --asset=autofts.ps1
     exit $LASTEXITCODE
 }
 

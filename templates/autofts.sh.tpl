@@ -308,7 +308,9 @@ install_deps() {
   for reg in $NPM_REGISTRIES; do
     echo "  尝试镜像: $reg"
     for i in 1 2; do
-      if npm install --registry="$reg" --no-audit --no-fund --ignore-scripts           --fetch-retries=1 --fetch-timeout=30000 >/dev/null 2>&1; then
+      # CI=1 + npm_config_yes=true + --yes 三保险: 杜绝任何交互式 y/n 提示卡住自动化
+      if CI=1 npm_config_yes=true npm install --yes --registry="$reg" --no-audit --no-fund --ignore-scripts \
+          --fetch-retries=1 --fetch-timeout=30000 >/dev/null 2>&1; then
         if deps_ok; then ok=1; break; fi
       fi
       [ "$i" -eq 1 ] && warn_msg "镜像 $reg 第 $i 次未成功，再试一次..."

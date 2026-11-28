@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 发行一致性检查（v1.8.3）
+ * 发行一致性检查（v1.8.4）
  *
  * 保证"源代码、发行版、README"三者对得上：
  *   - VERSION / README / RELEASE_NOTES / core.js 的版本号都是 1.7.1
@@ -16,7 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const ROOT = path.dirname(__dirname);
-const VER = '1.8.3';
+const VER = '1.8.4';
 
 let bad = 0;
 function check(name, cond, detail) {

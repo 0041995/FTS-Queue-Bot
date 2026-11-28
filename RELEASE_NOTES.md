@@ -1,3 +1,19 @@
+# v1.8.4 — 修复 selftest 节点超时 / 依赖安装无交互
+
+基于 v1.8.3。修复你遇到的 selftest 卡在"合约存在性"后 TIMEOUT 退出：
+
+1. **剔除失效节点**：官方 dataseed 系列 eth_call 实测 8~13s 超时，全部从默认池移除；换成 6 个实测正常节点（blastapi / meowrpc / publicnode×2 / 48club / sentio）。兜底节点也改掉。
+2. **探测短超时**：新增 `PROBE_TIMEOUT_MS`（默认 5s），探测节点用短超时，坏节点快速淘汰；正式 RPC 仍用 12s。
+3. **rotate 并行探测**：原来串行逐个等 12s，现在一次并行探测所有候选取最快可用。
+4. **修复 selftest 真正的 bug**：selftest 的合约对象固化在旧 provider 上，切换节点后仍打失效节点。现在每次重试都重绑到当前 provider，换节点真正生效。
+5. **依赖安装无交互**：`--install` 加 `CI=1` + `npm_config_yes=true` + `--yes`，杜绝 y/n 提示卡住自动化（stdin 关闭也能装成功）。
+
+**货币价格说明**：买卖挂单/吃单走市场合约 `createOrder`/`fillOrder`；查币价不走市场挂单价，而是通过 `market.pair()` 拿 DEX 交易对地址、读 `getReserves()` 储备算真实 USDT/FTS 价。逻辑未改，保持正确。
+
+新增 `test/node-and-install.js`（32 项），18 个测试文件全过。实测 selftest 23 秒完成、零超时告警。
+
+---
+
 # v1.8.3 — 依赖安装完全自动化 / 国内多镜像 / 新增 --install
 
 > 基于 v1.8.2：

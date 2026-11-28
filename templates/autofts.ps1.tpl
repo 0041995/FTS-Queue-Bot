@@ -343,14 +343,21 @@ function Install-Deps {
     $npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
     if (-not $npmCmd) { $npmCmd = Get-Command npm -ErrorAction SilentlyContinue }
     if (-not $npmCmd) { Write-Die "未找到 npm，请重装 Node.js" }
-    foreach ($reg in $Script:NpmRegistries) {
+    # CI=1 + npm_config_yes=true + --yes 三保险: 杜绝任何交互式 y/n 提示卡住自动化
+    $oldCI = $env:CI; $oldYes = $env:npm_config_yes
+    $env:CI = '1'; $env:npm_config_yes = 'true'
+    try {
+      foreach ($reg in $Script:NpmRegistries) {
         Write-Host "  尝试镜像: $reg"
         for ($t = 1; $t -le 2; $t++) {
-            & $npmCmd.Source install --registry="$reg" --no-audit --no-fund --ignore-scripts --fetch-retries=1 --fetch-timeout=30000 2>&1 | Out-Null
+            & $npmCmd.Source install --yes --registry="$reg" --no-audit --no-fund --ignore-scripts --fetch-retries=1 --fetch-timeout=30000 2>&1 | Out-Null
             if (Test-DepsOk) { Write-Ok "依赖安装成功 (镜像 $reg)"; return }
             if ($t -eq 1) { Write-WarnMsg "镜像 $reg 第 $t 次未成功，再试一次..." }
         }
         Write-WarnMsg "镜像 $reg 不可用，切换下一个"
+      }
+    } finally {
+      $env:CI = $oldCI; $env:npm_config_yes = $oldYes
     }
     Write-Die "所有国内镜像均安装失败。请用 --install 参数重试。"
 }
