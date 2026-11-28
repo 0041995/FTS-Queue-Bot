@@ -30,7 +30,8 @@ usage() {
   cat << 'HELP'
 用法: bash autofts.sh [模式]
 
-模式(共 7 个):
+模式(共 8 个):
+  --install    仅安装/修复依赖(自动依次尝试多个国内镜像，禁用官方源)，装完退出
   --probe      先探测网页合约，再链上只读探测: 验证合约地址/函数在不在(不需要私钥)
   --init       配置向导(房间/人数/延迟/手续费/账号)，配完即退出；改设置也用它
   --selftest   只读体检: 环境/依赖/RPC/合约/余额/授权 + 交易预演(一分钱不花)
@@ -40,6 +41,7 @@ usage() {
   --help       查看本帮助
 
 说明:
+  · 依赖安装: 只用国内公开镜像( npmmirror / 华为云 / 腾讯云 )，依次自动切换；官方源禁用
   · 加密可选: 设了环境变量 FTS_WALLET_PASSWORD 就自动加密，不设则保持明文(不影响运行)
   · 停止运行: 直接 Ctrl+C
 
@@ -58,7 +60,7 @@ usage() {
   AUTO_UPDATE        是否启用自动更新（默认关，需在 --init 的 [10] 显式开启）
   UPDATE_CHECK_MS    自动更新检查间隔，默认 1200000（20 分钟，仅在空闲窗口替换）
   MINER_ENABLED      是否自动组矿机；MINER_MODE=old/new/both
-  外联域名          BSC RPC/WSS、fatris.fans、api.github.com、registry.npmjs.org、1rpc.io
+  外联域名          BSC RPC/WSS、fatris.fans、api.github.com、国内npm镜像(npmmirror/华为云/腾讯云)、1rpc.io
 HELP
   exit 0
 }
@@ -186,6 +188,7 @@ while [ $# -gt 0 ]; do
     --probe)
       MODE="probe"; shift
       PROBE_ARGS="$*"; break ;;
+    --install)  MODE="install" ;;
     --selftest) MODE="selftest" ;;
     --dry-run)  MODE="dry-run" ;;
     --run)      MODE="run" ;;
@@ -258,30 +261,76 @@ ok_msg "Node $(node -v) / npm $(npm -v 2>/dev/null || echo '?')"
 strip_bom config.json
 strip_bom wallets.json
 
-# --- ethers (v1.7.1: 固定精确版本 + 禁安装脚本 + 装完校验版本，不再回退第三方镜像) ---
+# --- 依赖: 完全自动化安装，只用国内公开镜像(禁用官方站) ---
+# 三个镜像均实测可用(2026-11-28: npmmirror / 华为云 / 腾讯云 均能装出 ethers+ws)。
+# 依次尝试，任一成功即停；每个镜像可重试 2 次；全部失败才报错。
 ETHERS_VERSION="6.15.0"
 WS_VERSION="8.18.0"
-if ! node -e "require('ethers')" >/dev/null 2>&1; then
-  echo "安装依赖 ethers@$ETHERS_VERSION (固定版本，禁止安装脚本)..."
-  for i in 1 2 3; do
-    npm install "ethers@$ETHERS_VERSION" --no-audit --no-fund --ignore-scripts --save-exact && break
-    warn_msg "第 $i 次安装失败，2 秒后重试..."
-    sleep 2
-  done
-  # 光 require 成功不够: 必须确认装到的就是锁定的版本
-  node -e "const v=require('ethers').version; if(v!=='$ETHERS_VERSION'){console.error('ethers version mismatch: '+v);process.exit(1)}" \
-    || die "ethers 版本校验失败，请手动执行: cd $WORK_DIR && npm install ethers@$ETHERS_VERSION --ignore-scripts --save-exact"
-  # 不再自动回退 registry.npmmirror.com：第三方镜像是供应链攻击面，
-  # 而 ethers 是持有明文私钥并签名的核心依赖。如需镜像请自行配置 npm registry 后重试。
+# 可用 FTS_NPM_REGISTRIES 覆盖(空格分隔)，便于某镜像临时不可用时自定义
+if [ -n "${FTS_NPM_REGISTRIES:-}" ]; then
+  NPM_REGISTRIES="$FTS_NPM_REGISTRIES"
+else
+  NPM_REGISTRIES="
+https://registry.npmmirror.com
+https://mirrors.huaweicloud.com/repository/npm/
+https://mirrors.cloud.tencent.com/npm/
+"
 fi
-ok_msg "ethers $(node -e "console.log(require('ethers').version)" 2>/dev/null || echo '?') 已就绪"
 
-# --- ws (WebSocket 依赖，缺失时自动降级为 HTTP 轮询) ---
-if ! node -e "try{require('ws')}catch(e){process.exit(1)}" >/dev/null 2>&1; then
-  echo "安装 WebSocket 依赖 ws@$WS_VERSION ..."
-  npm install "ws@$WS_VERSION" --no-audit --no-fund --ignore-scripts --save-exact >/dev/null 2>&1 \
-    || warn_msg "ws 安装失败，将自动使用 HTTP 轮询模式兜底(仍可正常工作)"
+# 确保 package.json 存在且锁定版本(npm install 不会误删已装的包)。用 shell 直接写，避免引号嵌套。
+ensure_package_json() {
+  if [ ! -f package.json ]; then
+    cat > package.json <<PKG_EOF
+{
+  "name": "autofts",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "ethers": "$ETHERS_VERSION",
+    "ws": "$WS_VERSION"
+  }
+}
+PKG_EOF
+  fi
+}
+
+# 校验: ethers 必须可 require 且版本精确匹配；ws 只需可 require(缺失可降级 HTTP)
+deps_ok() {
+  node -e "const e=require('ethers');if(e.version!=='$ETHERS_VERSION')process.exit(1)" >/dev/null 2>&1 || return 1
+  node -e "require('ws')" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+install_deps() {
+  if deps_ok; then ok_msg "依赖已就绪 (ethers $ETHERS_VERSION / ws $WS_VERSION)"; return 0; fi
+  ensure_package_json
+  local reg ok=0 i
+  for reg in $NPM_REGISTRIES; do
+    echo "  尝试镜像: $reg"
+    for i in 1 2; do
+      if npm install --registry="$reg" --no-audit --no-fund --ignore-scripts           --fetch-retries=1 --fetch-timeout=30000 >/dev/null 2>&1; then
+        if deps_ok; then ok=1; break; fi
+      fi
+      [ "$i" -eq 1 ] && warn_msg "镜像 $reg 第 $i 次未成功，再试一次..."
+    done
+    [ "$ok" -eq 1 ] && { ok_msg "依赖安装成功 (镜像 $reg)"; return 0; }
+    warn_msg "镜像 $reg 不可用，切换下一个"
+  done
+  die "所有国内镜像均安装失败。可手动执行: bash autofts.sh --install 重试"
+}
+
+# --install: 只装依赖，装完退出(不做任何链上操作/不需要钱包)
+if [ "$MODE" = "install" ]; then
+  echo ""
+  echo "===== 依赖安装 (国内镜像，禁用官方源) ====="
+  install_deps
+  echo ""
+  ok_msg "依赖安装流程完成"
+  exit 0
 fi
+
+install_deps
+ok_msg "ethers $(node -e "console.log(require('ethers').version)" 2>/dev/null || echo '?') / ws 已就绪"
 
 # ==============================================================
 echo -e "\e[33m[2/5] 写入核心引擎...\e[0m"

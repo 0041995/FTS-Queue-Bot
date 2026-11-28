@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 发行一致性检查（v1.8.2）
+ * 发行一致性检查（v1.8.3）
  *
  * 保证"源代码、发行版、README"三者对得上：
  *   - VERSION / README / RELEASE_NOTES / core.js 的版本号都是 1.7.1
@@ -16,7 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const ROOT = path.dirname(__dirname);
-const VER = '1.8.2';
+const VER = '1.8.3';
 
 let bad = 0;
 function check(name, cond, detail) {
@@ -49,7 +49,8 @@ for (const s of [
 ]) {
   check('不含: ' + s, !readme.includes(s));
 }
-check('README 含外联域名说明', readme.includes('api.github.com') && readme.includes('registry.npmjs.org'));
+check('README 含外联域名说明', readme.includes('api.github.com') && readme.includes('registry.npmmirror.com'));
+check('README 不再列官方源为依赖来源', !readme.includes('registry.npmjs.org'));
 check('README 说明自动更新默认关闭', readme.includes('默认关闭'));
 check('README 说明 WEB_AUTO_SYNC 默认 false', readme.includes('`WEB_AUTO_SYNC`') && readme.includes('`false`'));
 

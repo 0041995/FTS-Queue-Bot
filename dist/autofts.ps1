@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 <#
-    FTS 多账号自动打金脚本 - Windows 版 v1.8.2
+    FTS 多账号自动打金脚本 - Windows 版 v1.8.3
     同一个文件同时兼容 PowerShell 5.1 (Desktop) 与 PowerShell 7 (Core)
 
     用法:
@@ -132,7 +132,8 @@ function Show-Usage {
     Write-Host @'
 用法: powershell -ExecutionPolicy Bypass -File autofts.ps1 [模式]
 
-模式(共 7 个):
+模式(共 8 个):
+  --install    仅安装/修复依赖(自动依次尝试多个国内镜像，禁用官方源)，装完退出
   --probe      先探测网页合约，再链上只读探测: 验证合约地址/函数在不在(不需要私钥)
   --init       配置向导(房间/人数/延迟/手续费/账号)，配完即退出；改设置也用它
   --selftest   只读体检: 环境/依赖/RPC/合约/余额/授权 + 交易预演(一分钱不花)
@@ -142,6 +143,7 @@ function Show-Usage {
   --help       查看本帮助
 
 说明:
+  · 依赖安装: 只用国内公开镜像( npmmirror / 华为云 / 腾讯云 )，依次自动切换；官方源禁用
   · 加密可选: 设了环境变量 FTS_WALLET_PASSWORD 就自动加密，不设则保持明文(不影响运行)
   · 停止运行: 直接 Ctrl+C
 
@@ -157,7 +159,7 @@ function Show-Usage {
   MIN_BNB_GAS        最低 BNB 提醒阈值，默认 0.005
   MINING_CLAIM_MS    矿机产出领取扫描间隔，默认 45000（只要可领就立刻领）
   MINER_ENABLED      是否自动组矿机；MINER_MODE=old/new/both
-  外联域名          BSC RPC/WSS、fatris.fans、api.github.com、registry.npmjs.org、1rpc.io
+  外联域名          BSC RPC/WSS、fatris.fans、api.github.com、国内npm镜像(npmmirror/华为云/腾讯云)、1rpc.io
   UPDATE_TOKEN       可选：仅私有仓库需要的 GitHub 只读 token；公开仓库无需 token
   AUTO_UPDATE        是否启用自动更新（默认关，需在 --init 的 [10] 显式开启）
   UPDATE_CHECK_MS    自动更新检查间隔，默认 1200000（20 分钟，仅在空闲窗口替换）
@@ -250,7 +252,7 @@ $DoWizard  = $false
 $ProbeArgs = @()
 
 $Script:OrigArgs = @($args)
-$env:FTS_APP_VERSION = '1.8.2'
+$env:FTS_APP_VERSION = '1.8.3'
 for ($i = 0; $i -lt $args.Count; $i++) {
     $a = [string]$args[$i]
     if ($a -eq '--probe') {
@@ -258,6 +260,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
         if ($i + 1 -lt $args.Count) { $ProbeArgs = @($args[($i + 1)..($args.Count - 1)]) }
         break
     }
+    elseif ($a -eq '--install')  { $Mode = 'install' }
     elseif ($a -eq '--selftest') { $Mode = 'selftest' }
     elseif ($a -eq '--dry-run')  { $Mode = 'dry-run' }
     elseif ($a -eq '--run')      { $Mode = 'run' }
@@ -308,42 +311,64 @@ function Invoke-NodeJs {
     return $out
 }
 
-# --- ethers (v1.7.1: 固定精确版本 + 禁安装脚本 + 装完校验版本，不再回退第三方镜像) ---
+# --- 依赖: 完全自动化安装，只用国内公开镜像(禁用官方站) ---
+# 三个镜像均实测可用(2026-11-28)。依次尝试，任一成功即停；全失败才报错。
 $Script:EthersVersion = '6.15.0'
 $Script:WsVersion = '8.18.0'
-$null = Invoke-NodeJs 'check-ethers' 'require("ethers");'
-if ($Script:LastNodeExit -ne 0) {
-    Write-Host "安装依赖 ethers@$($Script:EthersVersion) (固定版本，禁止安装脚本)..."
+$Script:NpmRegistries = @(
+    'https://registry.npmmirror.com',
+    'https://mirrors.huaweicloud.com/repository/npm/',
+    'https://mirrors.cloud.tencent.com/npm/'
+)
+if ($env:FTS_NPM_REGISTRIES) { $Script:NpmRegistries = @($env:FTS_NPM_REGISTRIES -split '\s+') }
+
+function Test-DepsOk {
+    $null = Invoke-NodeJs 'deps-ethers' "const e=require('ethers');if(e.version!=='$($Script:EthersVersion)')process.exit(1)"
+    if ($Script:LastNodeExit -ne 0) { return $false }
+    $null = Invoke-NodeJs 'deps-ws' 'require("ws");'
+    return ($Script:LastNodeExit -eq 0)
+}
+function Ensure-PackageJson {
+    if (-not (Test-Path -LiteralPath 'package.json')) {
+        $pj = [ordered]@{
+            name = 'autofts'; version = '1.0.0'; private = $true
+            dependencies = [ordered]@{ ethers = $Script:EthersVersion; ws = $Script:WsVersion }
+        }
+        ($pj | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath 'package.json' -Encoding utf8
+    }
+}
+function Install-Deps {
+    if (Test-DepsOk) { Write-Ok "依赖已就绪 (ethers $($Script:EthersVersion) / ws $($Script:WsVersion))"; return }
+    Ensure-PackageJson
     $npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
     if (-not $npmCmd) { $npmCmd = Get-Command npm -ErrorAction SilentlyContinue }
     if (-not $npmCmd) { Write-Die "未找到 npm，请重装 Node.js" }
-    $npmExe = $npmCmd.Source
-    for ($t = 1; $t -le 3; $t++) {
-        & $npmExe install "ethers@$($Script:EthersVersion)" --no-audit --no-fund --ignore-scripts --save-exact 2>&1 | Out-Host
-        $null = Invoke-NodeJs 'check-ethers' 'require("ethers");'
-        if ($Script:LastNodeExit -eq 0) { break }
-        Write-WarnMsg "第 $t 次安装失败，2 秒后重试..."
-        Start-Sleep -Seconds 2
+    foreach ($reg in $Script:NpmRegistries) {
+        Write-Host "  尝试镜像: $reg"
+        for ($t = 1; $t -le 2; $t++) {
+            & $npmCmd.Source install --registry="$reg" --no-audit --no-fund --ignore-scripts --fetch-retries=1 --fetch-timeout=30000 2>&1 | Out-Null
+            if (Test-DepsOk) { Write-Ok "依赖安装成功 (镜像 $reg)"; return }
+            if ($t -eq 1) { Write-WarnMsg "镜像 $reg 第 $t 次未成功，再试一次..." }
+        }
+        Write-WarnMsg "镜像 $reg 不可用，切换下一个"
     }
-    # 光 require 成功不够: 必须确认装到的就是锁定的版本
-    $null = Invoke-NodeJs 'ver-ethers-check' "const v=require('ethers').version;if(v!=='$($Script:EthersVersion)'){console.error('version mismatch: '+v);process.exit(1)}"
-    if ($Script:LastNodeExit -ne 0) { Write-Die "ethers 版本校验失败，请手动执行: cd `"$Script:WorkDir`"; npm install ethers@$($Script:EthersVersion) --ignore-scripts --save-exact" }
+    Write-Die "所有国内镜像均安装失败。请用 --install 参数重试。"
 }
+
+# --install: 只装依赖，装完退出(不做任何链上操作/不需要钱包)
+if ($Mode -eq 'install') {
+    Write-Host ""
+    Write-Host "===== 依赖安装 (国内镜像，禁用官方源) ====="
+    Install-Deps
+    Write-Host ""
+    Write-Ok "依赖安装流程完成"
+    exit 0
+}
+
+Install-Deps
 $ethVer = Invoke-NodeJs 'ver-ethers' 'console.log(require("ethers").version);'
 Write-Ok "ethers $ethVer 已就绪"
 
-# --- ws (WebSocket，缺失时自动降级为 HTTP 轮询) ---
-$null = Invoke-NodeJs 'check-ws' 'try{require("ws")}catch(e){process.exit(1)}'
-if ($Script:LastNodeExit -ne 0) {
-    Write-Host "安装 WebSocket 依赖 ws ..."
-    $npmCmd2 = Get-Command npm.cmd -ErrorAction SilentlyContinue
-    if (-not $npmCmd2) { $npmCmd2 = Get-Command npm -ErrorAction SilentlyContinue }
-    if ($npmCmd2) { & $npmCmd2.Source install "ws@$($Script:WsVersion)" --no-audit --no-fund --ignore-scripts --save-exact 2>&1 | Out-Host }
-    $null = Invoke-NodeJs 'check-ws' 'try{require("ws")}catch(e){process.exit(1)}'
-    if ($Script:LastNodeExit -ne 0) { Write-WarnMsg "ws 安装失败，将自动使用 HTTP 轮询模式兜底(仍可正常工作)" }
-}
-
-# ============================================================
 Write-Step "[2/5] 写入核心引擎..."
 $CoreJs = @'
 'use strict';
@@ -379,8 +404,8 @@ const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
 // v1.7.1: 引擎日志版本与发行包版本统一，不再出现两套互不相同的版本号。
-// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.2。
-const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.2';
+// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.3。
+const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.3';
 const VERSION = APP_VERSION;
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
@@ -4322,7 +4347,7 @@ if ($Mode -eq 'probe') {
 # --update: 原地替换脚本（私有仓库需在 config.json 写 UPDATE_TOKEN）
 if ($Mode -eq 'update') {
     Write-Host ""
-    & $Script:NodeExe update.js --apply --current="1.8.2" --asset=autofts.ps1
+    & $Script:NodeExe update.js --apply --current="1.8.3" --asset=autofts.ps1
     exit $LASTEXITCODE
 }
 

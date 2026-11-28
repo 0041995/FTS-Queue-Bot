@@ -5,7 +5,7 @@
 > 帮你自动排队、自动领退款和 FTS 空投、自动处理中奖额度的本地小工具。
 > 不托管资金、不抽成、不联网上传私钥。
 >
-> **当前版本：v1.8.2**（命令精简为 7 个：--settings 合并进 --init、--encrypt/--stop 删除、网页合约探测并入 --probe 开头；加密改为可选+自动，详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)）
+> **当前版本：v1.8.3**（依赖安装完全自动化：新增 --install 参数，自动切换三个国内镜像、禁用官方源，详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)）
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Latest Release](https://img.shields.io/github/v/release/0041995/FTS-Queue-Bot)](https://github.com/0041995/FTS-Queue-Bot/releases/latest)
@@ -129,10 +129,11 @@ bash autofts.sh --init
 --dry-run    全流程演练：交易不上链
 --run        正式运行
 --update     手动一键更新
+--install    仅安装/修复依赖(自动切换国内镜像)，装完退出
 --help       查看帮助
 ```
 
-一共 7 个命令。停止运行直接 **Ctrl+C**。第一次请按 `--probe → --init → --selftest → --dry-run → --run` 走一遍。
+一共 8 个命令。停止运行直接 **Ctrl+C**。第一次请按 `--probe → --init → --selftest → --dry-run → --run` 走一遍。
 
 ---
 
@@ -247,9 +248,9 @@ bash autofts.sh --init
 - **授权按轮、有硬上限**：默认每轮只授权一轮票价；按场数最多 3 场、按 U 数最多 100 U；**不做无限授权**，`approve` 也不会锁定你的资金。v1.7.1 起「填 0 = 全部余额」已废弃。注意：减小额度减小的是 **spender 可划走的上限**，不是「资金占用」；已授权但尚未消耗的额度会一直留在链上，直到被消耗或撤销。
 - **只读模式可验证**：`--probe` / `--selftest` 不需要私钥、不花一分钱。
 - **完全开源**：代码在 `src/`，产物由 `build/build.py` 生成，`dist/` 也随仓库入库，可自行构建比对。
-- **外联域名（可枚举）**：BSC RPC / WSS 节点、`fatris.fans`（网页合约探测）、`api.github.com` 与 `github.com`（检查更新、下载附件）、`registry.npmjs.org`（安装依赖）、`1rpc.io` 与 `bsc-rpc.publicnode.com`（推荐人自动识别）、文档里提到的 `nodejs.org`。**没有后台服务，也没有把私钥或 `wallets.json` 主动外传的代码**；但「只跟 BSC 节点和游戏合约通信」是不准确的旧说法。
+- **外联域名（可枚举）**：BSC RPC / WSS 节点、`fatris.fans`（网页合约探测）、`api.github.com` 与 `github.com`（检查更新、下载附件）、`registry.npmmirror.com` / `mirrors.huaweicloud.com` / `mirrors.cloud.tencent.com`（安装依赖，三个国内镜像）、`1rpc.io` 与 `bsc-rpc.publicnode.com`（推荐人自动识别）、文档里提到的 `nodejs.org`。**没有后台服务，也没有把私钥或 `wallets.json` 主动外传的代码**；但「只跟 BSC 节点和游戏合约通信」是不准确的旧说法。
 - **转账能力（默认关）**：`FLEX_DECISION` 开启后会转 BNB / USDT 给自有账号，`startGapFixer()` 会发 0 值自转，FTS 买卖会 `fillOrder` / `createOrder`。所以「完全没有转账能力」是不准确的旧说法 —— 这些路径默认关闭，且只面向你自己的账号。
-- **依赖供应链**：`ethers` / `ws` 固定精确版本、带 `--ignore-scripts --save-exact`，装完校验版本；不再自动回退第三方镜像。npm 自身会校验 registry 返回的包完整性，但没有随仓库附带 lockfile，这是已知边界。
+- **依赖供应链**：`ethers` / `ws` 固定精确版本、带 `--ignore-scripts`，装完校验版本。**只用国内公开镜像**（npmmirror → 华为云 → 腾讯云，依次自动切换），官方源已禁用；可用环境变量 `FTS_NPM_REGISTRIES` 自定义镜像列表。npm 自身会校验 registry 返回的包完整性，但没有随仓库附带 lockfile，这是已知边界。
 
 ⚠️ `wallets.json` **就是你的私钥**。别同步网盘、别发聊天工具、别提交 Git，务必用专门的小号钱包。
 

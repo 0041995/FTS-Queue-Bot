@@ -31,8 +31,8 @@ const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
 // v1.7.1: 引擎日志版本与发行包版本统一，不再出现两套互不相同的版本号。
-// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.2。
-const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.2';
+// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.3。
+const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.3';
 const VERSION = APP_VERSION;
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
