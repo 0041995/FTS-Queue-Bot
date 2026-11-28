@@ -31,8 +31,8 @@ const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
 // v1.7.1: 引擎日志版本与发行包版本统一，不再出现两套互不相同的版本号。
-// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.1。
-const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.1';
+// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.2。
+const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.2';
 const VERSION = APP_VERSION;
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
@@ -3165,7 +3165,7 @@ function loadWallets() {
     try { data = decryptWalletsFile(data, pwd); }
     catch (e) { fatal('CFG', '钱包解密失败: ' + e.message); return []; }
   } else {
-    warn('CFG', '⚠️ wallets.json 是明文存储！建议运行 --encrypt 加密，避免私钥泄露');
+    warn('CFG', '⚠️ wallets.json 是明文存储！设置环境变量 FTS_WALLET_PASSWORD 可自动加密，避免私钥泄露');
   }
   const list = data.wallets || [];
   const out = [];
@@ -3207,7 +3207,41 @@ function readPasswordLines() {
     });
   });
 }
-// 加密 wallets.json: 读明文 -> 输入密码两次 -> 写加密格式 -> 验证解密
+// 把明文 wallets.json 加密写盘。password 由调用方给出。返回 true=已加密 / false=跳过。绝不抛异常到调用方。
+function encryptWalletsWithPassword(password, opts) {
+  opts = opts || {};
+  const quiet = !!opts.quiet;
+  if (!fs.existsSync(WALLETS_FILE)) { if (!quiet) warn('CFG', '找不到 ' + WALLETS_FILE + '，跳过加密'); return false; }
+  let obj;
+  try { obj = JSON.parse(fs.readFileSync(WALLETS_FILE, 'utf8').replace(/^﻿/, '')); }
+  catch (e) { if (!quiet) warn('CFG', 'wallets.json 解析失败，跳过加密: ' + e.message); return false; }
+  if (obj.encrypted === true) { if (!quiet) info('CFG', 'wallets.json 已是加密格式，跳过'); return false; }
+  if (!obj.wallets || !obj.wallets.length) { if (!quiet) warn('CFG', 'wallets.json 没有账号，跳过加密'); return false; }
+  if (!password || password.length < 8) { if (!quiet) warn('CFG', '密码少于8位，跳过加密'); return false; }
+  const enc = encryptWalletsFile(obj, password);
+  try {
+    const back = decryptWalletsFile(enc, password);
+    if (!back.wallets || back.wallets.length !== obj.wallets.length) throw new Error('解密后账号数不符');
+  } catch (e) { warn('CFG', '加密自检失败，未写入: ' + e.message); return false; }
+  const tmp = WALLETS_FILE + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(enc), { mode: 0o600 });
+    fs.renameSync(tmp, WALLETS_FILE);
+  } catch (e) { warn('CFG', '加密写入失败，保持明文: ' + e.message); return false; }
+  finally { try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e) { } }
+  ok('CFG', `wallets.json 已加密(${obj.wallets.length} 个账号，密码来自 FTS_WALLET_PASSWORD)`);
+  if (!quiet) warn('CFG', '⚠️ 请务必记住密码，丢失后无法恢复钱包！');
+  return true;
+}
+// 自动加密: 只在设了 FTS_WALLET_PASSWORD 且钱包是明文时加密；没设密码=可选跳过，不阻断。
+function autoEncryptWallets(opts) {
+  const pwd = getWalletPassword();
+  if (!pwd) { info('CFG', '未设置 FTS_WALLET_PASSWORD，保持明文(加密可选，跳过)'); return false; }
+  return encryptWalletsWithPassword(pwd, opts);
+}
+// 内部命令: 向导保存后调用。有环境变量就加密，没有就跳过(不交互、不阻断)。
+function cmdAutoEncrypt() { autoEncryptWallets(); exitFlush(0); }
+// 交互式加密(内部保留)
 async function cmdEncrypt() {
   if (!fs.existsSync(WALLETS_FILE)) { fatal('CFG', '找不到 ' + WALLETS_FILE); exitFlush(1); return; }
   const raw = fs.readFileSync(WALLETS_FILE, 'utf8').replace(/^﻿/, '');
@@ -3219,26 +3253,13 @@ async function cmdEncrypt() {
   const p1 = lines[0], p2 = lines[1];
   if (!p1 || p1.length < 8) { fatal('CFG', '密码不能少于8位，已取消'); exitFlush(1); return; }
   if (p1 !== p2) { fatal('CFG', '两次密码不一致，已取消'); exitFlush(1); return; }
-  const enc = encryptWalletsFile(obj, p1);
-  // 验证能正确解密(防止写出坏文件把钱包锁死)
-  try {
-    const back = decryptWalletsFile(enc, p1);
-    if (!back.wallets || back.wallets.length !== obj.wallets.length) throw new Error('解密后账号数不符');
-  } catch (e) { fatal('CFG', '加密自检失败，未写入: ' + e.message); exitFlush(1); return; }
-  const tmp = WALLETS_FILE + '.tmp';
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(enc), { mode: 0o600 });
-    fs.renameSync(tmp, WALLETS_FILE);
-  } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (e) { } } }
-  // v1.7.1: 删除了原来的 `raw && (()=>{})();` —— 它是空操作，且 JS 字符串不可变，
-  // 无法可靠清零。真实保护来自 0600 权限 + AES-GCM 加密 + 明文不写日志/不回显。
-  ok('CFG', `wallets.json 已加密(${obj.wallets.length} 个账号)。运行时用环境变量 FTS_WALLET_PASSWORD 提供密码`);
-  warn('CFG', '⚠️ 请务必记住密码，丢失后无法恢复钱包！');
+  encryptWalletsWithPassword(p1);
   exitFlush(0);
 }
 
 // ---------------- 主流程 ----------------
 async function main() {
+  if (MODE === 'autoencrypt') return cmdAutoEncrypt();
   if (MODE === 'encrypt') return cmdEncrypt();
   if (MODE === 'sync-web') {
     try {
@@ -3264,6 +3285,7 @@ async function main() {
     : `自动 ×${CFG.GAS_MULT} (上限 ${CFG.GAS_MAX_GWEI} gwei)`;
   info('SYS', `FTS 引擎 v${VERSION} 启动 | 模式=${MODE} | 房间=${CFG.ROOMS.join(',')} | 抢位=[${CFG.SNIPE_MIN_COUNT},${CFG.SNIPE_MAX_COUNT}) | 延迟=${CFG.SNIPE_DELAY_MS}ms | 手续费=${gasDesc}`);
   info('SYS', `队列合约=${CFG.QUEUE_ADDR} | 中奖自动领取=${CFG.CLAIM_WIN ? '开' : '关'} | 组矿机=${CFG.MINER_ENABLED ? `${CFG.MINER_MODE}(固定${CFG.MINER_USD}U/老队列 ${CFG.MINER_QUEUE_ADDR})` : '关'} | 矿机产出领取=${CFG.MINING_CLAIM ? `开(每${Math.round(CFG.MINING_CLAIM_MS / 1000)}s检测)` : '关'}`);
+  autoEncryptWallets();   // 可选: 设了 FTS_WALLET_PASSWORD 且明文 -> 自动加密；没设 -> 保持明文不阻断
   const wallets = loadWallets();
   if (!wallets.length) { fatal('SYS', '没有可用账号，退出(错误码 21)'); exitFlush(21); return; }
   try { fs.chmodSync(WALLETS_FILE, 0o600); } catch (e) { }

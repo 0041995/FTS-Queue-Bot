@@ -5,7 +5,7 @@
 > 帮你自动排队、自动领退款和 FTS 空投、自动处理中奖额度的本地小工具。
 > 不托管资金、不抽成、不联网上传私钥。
 >
-> **当前版本：v1.8.1**（基于 v1.8.0：修复加密钱包无法从官方入口启动、网页合约同步开关可在向导配置、新增每日场次限制，详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)）
+> **当前版本：v1.8.2**（命令精简为 7 个：--settings 合并进 --init、--encrypt/--stop 删除、网页合约探测并入 --probe 开头；加密改为可选+自动，详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)）
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Latest Release](https://img.shields.io/github/v/release/0041995/FTS-Queue-Bot)](https://github.com/0041995/FTS-Queue-Bot/releases/latest)
@@ -116,23 +116,23 @@ powershell -ExecutionPolicy Bypass -File .\autofts.ps1 --init
 bash autofts.sh --init
 ```
 
-按提示选房间、人数区间、添加账号（私钥只存在本地 `wallets.json`）。**改设置随时用 `--settings`。**
+按提示选房间、人数区间、添加账号（私钥只存在本地 `wallets.json`）。**改设置随时再跑 `--init`**（`--settings` 已合并进来）。
 
 `[7] 添加账号` 会在写入前即时校验「私钥是否对应该地址」，不匹配直接拒绝，不会把错的私钥明文落盘。
 
 ### 第 3 步｜先看再跑
 
 ```
---probe      只读勘探：验证合约地址和函数（不需要私钥，不花钱）
+--probe      先探测网页合约，再链上只读勘探：验证合约地址/函数（不需要私钥，不花钱）
+--init       配置向导（房间/人数/延迟/手续费/账号），配完退出；改设置也用它
 --selftest   只读体检：节点、合约、余额、授权、交易预演
 --dry-run    全流程演练：交易不上链
 --run        正式运行
---sync-web   从网页探测合约地址（默认只提示，资金字段需显式允许才写回）
 --update     手动一键更新
---stop       停止
+--help       查看帮助
 ```
 
-第一次请严格按 `--probe → --init → --selftest → --dry-run → --run` 走一遍。
+一共 7 个命令。停止运行直接 **Ctrl+C**。第一次请按 `--probe → --init → --selftest → --dry-run → --run` 走一遍。
 
 ---
 
@@ -175,7 +175,7 @@ bash autofts.sh --init
 | `WEB_AUTO_SYNC` | `false` | 是否在启动后台自动探测并写回。默认关 |
 | `WEB_SYNC_ALLOW_FUNDS_KEYS` | `false` | 是否允许改写资金相关字段（`QUEUE_ADDR` / `USDT_ADDR` / `MINER_QUEUE_ADDR` / `MARKET_ADDR`）。默认冻结 |
 
-手动执行 `--sync-web` 会打印每个地址、每个被拒绝字段及原因。安全规则：
+`--probe` 开头的网页探测会打印每个地址、每个被拒绝字段及原因。安全规则：
 
 1. 链上校验必须**显式通过**；RPC 不可用 / 节点报错 / `getCode` 为空，**一个地址都不写回**
 2. 只有 `VITE_*` 字面量映射命中、且字段在白名单里才可能写回
@@ -243,7 +243,7 @@ bash autofts.sh --init
 ## 安全与隐私
 
 - **私钥不出本机**：只存在运行目录的 `wallets.json`，不上传、不回传。Windows 版自动收紧文件权限。
-- **支持加密存储**：跑一次 `--encrypt` 设置密码，`wallets.json` 会变成 AES-256-GCM 密文（scrypt 派生密钥，随机 salt，篡改会被认证拒绝）。运行时用环境变量 `FTS_WALLET_PASSWORD` 提供密码。⚠️ 环境变量可被同机 `/proc/<pid>/environ` 等途径读到，且写进 shell 命令会留在 history；请自行评估。JS 字符串不可变，明文无法可靠清零，真正的保护来自文件权限与加密。
+- **支持加密存储（可选）**：设置环境变量 `FTS_WALLET_PASSWORD` 后，`--init` 保存账号或运行 `--selftest`/`--dry-run`/`--run` 时会自动把 `wallets.json` 加密成 AES-256-GCM 密文（scrypt 派生密钥，随机 salt，篡改会被认证拒绝）。**不设密码就保持明文，不阻断运行**。⚠️ 环境变量可被同机 `/proc/<pid>/environ` 等途径读到，且写进 shell 命令会留在 history；请自行评估。JS 字符串不可变，明文无法可靠清零，真正的保护来自文件权限与加密。
 - **授权按轮、有硬上限**：默认每轮只授权一轮票价；按场数最多 3 场、按 U 数最多 100 U；**不做无限授权**，`approve` 也不会锁定你的资金。v1.7.1 起「填 0 = 全部余额」已废弃。注意：减小额度减小的是 **spender 可划走的上限**，不是「资金占用」；已授权但尚未消耗的额度会一直留在链上，直到被消耗或撤销。
 - **只读模式可验证**：`--probe` / `--selftest` 不需要私钥、不花一分钱。
 - **完全开源**：代码在 `src/`，产物由 `build/build.py` 生成，`dist/` 也随仓库入库，可自行构建比对。
@@ -255,9 +255,8 @@ bash autofts.sh --init
 
 > 加密用法：
 > ```
-> bash autofts.sh --encrypt          # 设置密码（至少8位）
 > export FTS_WALLET_PASSWORD=你的密码  # 运行前提供（注意 history 风险）
-> bash autofts.sh --run
+> bash autofts.sh --run               # 检测到明文会自动加密
 > ```
 
 ---
@@ -335,6 +334,6 @@ node test/perf-guards.js           # v1.8.0 资源占用护栏（定时器/节�
 **换合约不用改代码**：游戏网页会把合约地址写在 `VITE_P2_*` 映射里。脚本会做**有上限的抽样扫描**——从配置的页面出发，抓同域页面链接、递归 2 轮 JS chunk，解析字面量 `VITE_*` 映射；VITE 键缺失时还会用 ABI 函数特征做**提示性**识别（v1.7.1 起该结果不写回配置）。校验链上代码存在后，只有非资金字段且显式允许时才写回 `config.json`。
 
 - 启动时后台**轻量扫描**（最多 8 个 JS，且默认不自动同步）
-- 手动 `--sync-web` 走**完整扫描**（最多 15 页 / 40 个 JS）
+- `--probe` 开头的网页探测走**完整扫描**（最多 15 页 / 40 个 JS）
 
 **自动更新**：默认关闭；开启后引擎启动即检测一次新版本，之后每 20 分钟检查，发现后只在空闲窗口应用，超时也**不会**强制打断抢单。发布由维护者打 `v*` tag 触发，Release 正文取自 `RELEASE_NOTES.md`。

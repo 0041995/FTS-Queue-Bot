@@ -30,18 +30,18 @@ usage() {
   cat << 'HELP'
 用法: bash autofts.sh [模式]
 
-模式:
-  --probe      链上只读探测: 验证合约地址/函数在不在(完全不需要钱包私钥)
+模式(共 7 个):
+  --probe      先探测网页合约，再链上只读探测: 验证合约地址/函数在不在(不需要私钥)
+  --init       配置向导(房间/人数/延迟/手续费/账号)，配完即退出；改设置也用它
   --selftest   只读体检: 环境/依赖/RPC/合约/余额/授权 + 交易预演(一分钱不花)
   --dry-run    全流程预演: 走完所有逻辑但交易不上链
   --run        正式运行(默认)
-  --init       打开配置向导(房间/抢位区间/延迟/手续费/账号)，配完即退出
-  --settings   同 --init，随时回来改设置
-  --encrypt    加密 wallets.json(设置密码，运行时用 FTS_WALLET_PASSWORD 提供)
-  --sync-web   从游戏网页探测合约地址(默认只提示，资金字段需显式允许才写回)
   --update     一键更新到最新版本(原地替换脚本，支持私有仓库)
-  --stop       停止后台运行的引擎
   --help       查看本帮助
+
+说明:
+  · 加密可选: 设了环境变量 FTS_WALLET_PASSWORD 就自动加密，不设则保持明文(不影响运行)
+  · 停止运行: 直接 Ctrl+C
 
 建议首次使用顺序:
   --probe  ->  --init  ->  --selftest  ->  --dry-run  ->  --run
@@ -189,12 +189,8 @@ while [ $# -gt 0 ]; do
     --selftest) MODE="selftest" ;;
     --dry-run)  MODE="dry-run" ;;
     --run)      MODE="run" ;;
-    --encrypt)  MODE="encrypt" ;;
-    --sync-web) MODE="sync-web" ;;
     --init)     DO_INIT=1 ;;
-    --settings) DO_WIZARD=1 ;;
     --update)   MODE="update" ;;
-    --stop)     stop_engine ;;
     -h|--help)  usage ;;
     *) echo "未知参数: $1 (用 --help 查看用法)"; exit 2 ;;
   esac
@@ -303,18 +299,11 @@ UPDATEJS_EOF
 node --check update.js || die "update.js 生成异常(语法错误)"
 ok_msg "核心引擎 core.js + 只读探针 probe.js + 更新器 update.js 已写入"
 
-# --encrypt / --sync-web 都在"要求输入私钥"的向导之前退出
-if [ "$MODE" = "encrypt" ]; then
-  node core.js encrypt
-  exit $?
-fi
-if [ "$MODE" = "sync-web" ]; then
-  node core.js sync-web
-  exit $?
-fi
-
-# --probe 是纯只读探测，必须在"要求输入私钥"之前退出
+# --probe: 开头先探测网页合约(同步地址)，再做链上只读探测。都在"要求输入私钥"之前退出
 if [ "$MODE" = "probe" ]; then
+  echo ""
+  echo "  ---- 先从游戏网页探测最新合约 ----"
+  node core.js sync-web 2>&1 | sed 's/^/  /' || warn_msg "网页探测失败，继续链上探测"
   echo ""
   # 防止把 --help 之类的开关当成合约地址传下去
   case "$PROBE_ARGS" in
@@ -1184,6 +1173,8 @@ if [ "$DO_INIT" = 1 ] || [ "$DO_WIZARD" = 1 ] || [ ! -f wallets.json ]; then
     echo ""
     ok_msg "配置已保存到 config.json（账号在 wallets.json）"
     echo "  当前设置: 房间=$(wiz_rooms_text) 抢位=${WIZ_MIN}~${WIZ_MAX} 延迟=${WIZ_DELAY}ms 手续费=$(wiz_gas_text)"
+    # 自动加密: 设了 FTS_WALLET_PASSWORD 就加密，没设就跳过(不阻断)
+    node core.js autoencrypt
     echo ""
     echo "下一步建议(按顺序):"
     echo "  bash autofts.sh --selftest   # 只读体检，一分钱不花"

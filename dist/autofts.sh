@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================
-# FTS 多账号自动打金脚本 v1.8.1 - 加固版 (Termux / Linux 通用)
+# FTS 多账号自动打金脚本 v1.8.2 - 加固版 (Termux / Linux 通用)
 # ==============================================================
 set -uo pipefail
 
@@ -10,7 +10,7 @@ export FTS_LAUNCHER=bash
 WORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$WORK_DIR" || exit 1
 ORIG_ARGS=("$@")        # 自动更新后原地重启用
-export FTS_APP_VERSION="1.8.1"
+export FTS_APP_VERSION="1.8.2"
 mkdir -p logs
 # Windows 上用记事本把 json 存成 "UTF-8 带 BOM" 时，JSON.parse 会直接抛错、
 # 整份配置被静默忽略。启动时统一把 BOM 去掉，一劳永逸。
@@ -30,18 +30,18 @@ usage() {
   cat << 'HELP'
 用法: bash autofts.sh [模式]
 
-模式:
-  --probe      链上只读探测: 验证合约地址/函数在不在(完全不需要钱包私钥)
+模式(共 7 个):
+  --probe      先探测网页合约，再链上只读探测: 验证合约地址/函数在不在(不需要私钥)
+  --init       配置向导(房间/人数/延迟/手续费/账号)，配完即退出；改设置也用它
   --selftest   只读体检: 环境/依赖/RPC/合约/余额/授权 + 交易预演(一分钱不花)
   --dry-run    全流程预演: 走完所有逻辑但交易不上链
   --run        正式运行(默认)
-  --init       打开配置向导(房间/抢位区间/延迟/手续费/账号)，配完即退出
-  --settings   同 --init，随时回来改设置
-  --encrypt    加密 wallets.json(设置密码，运行时用 FTS_WALLET_PASSWORD 提供)
-  --sync-web   从游戏网页探测合约地址(默认只提示，资金字段需显式允许才写回)
   --update     一键更新到最新版本(原地替换脚本，支持私有仓库)
-  --stop       停止后台运行的引擎
   --help       查看本帮助
+
+说明:
+  · 加密可选: 设了环境变量 FTS_WALLET_PASSWORD 就自动加密，不设则保持明文(不影响运行)
+  · 停止运行: 直接 Ctrl+C
 
 建议首次使用顺序:
   --probe  ->  --init  ->  --selftest  ->  --dry-run  ->  --run
@@ -189,12 +189,8 @@ while [ $# -gt 0 ]; do
     --selftest) MODE="selftest" ;;
     --dry-run)  MODE="dry-run" ;;
     --run)      MODE="run" ;;
-    --encrypt)  MODE="encrypt" ;;
-    --sync-web) MODE="sync-web" ;;
     --init)     DO_INIT=1 ;;
-    --settings) DO_WIZARD=1 ;;
     --update)   MODE="update" ;;
-    --stop)     stop_engine ;;
     -h|--help)  usage ;;
     *) echo "未知参数: $1 (用 --help 查看用法)"; exit 2 ;;
   esac
@@ -323,8 +319,8 @@ const MODE = process.argv[2] || 'run';
 const DRY_RUN = MODE === 'dry-run';
 const SELFTEST = MODE === 'selftest';
 // v1.7.1: 引擎日志版本与发行包版本统一，不再出现两套互不相同的版本号。
-// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.1。
-const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.1';
+// 外壳脚本把 VERSION 文件的内容通过 FTS_APP_VERSION 注入；单独运行 core.js 时回落到 1.8.2。
+const APP_VERSION = process.env.FTS_APP_VERSION || '1.8.2';
 const VERSION = APP_VERSION;
 // 提示文案里的启动命令: Windows 上应显示 .ps1 的写法
 const LAUNCH = process.env.FTS_LAUNCHER === 'ps1'
@@ -3457,7 +3453,7 @@ function loadWallets() {
     try { data = decryptWalletsFile(data, pwd); }
     catch (e) { fatal('CFG', '钱包解密失败: ' + e.message); return []; }
   } else {
-    warn('CFG', '⚠️ wallets.json 是明文存储！建议运行 --encrypt 加密，避免私钥泄露');
+    warn('CFG', '⚠️ wallets.json 是明文存储！设置环境变量 FTS_WALLET_PASSWORD 可自动加密，避免私钥泄露');
   }
   const list = data.wallets || [];
   const out = [];
@@ -3499,7 +3495,41 @@ function readPasswordLines() {
     });
   });
 }
-// 加密 wallets.json: 读明文 -> 输入密码两次 -> 写加密格式 -> 验证解密
+// 把明文 wallets.json 加密写盘。password 由调用方给出。返回 true=已加密 / false=跳过。绝不抛异常到调用方。
+function encryptWalletsWithPassword(password, opts) {
+  opts = opts || {};
+  const quiet = !!opts.quiet;
+  if (!fs.existsSync(WALLETS_FILE)) { if (!quiet) warn('CFG', '找不到 ' + WALLETS_FILE + '，跳过加密'); return false; }
+  let obj;
+  try { obj = JSON.parse(fs.readFileSync(WALLETS_FILE, 'utf8').replace(/^﻿/, '')); }
+  catch (e) { if (!quiet) warn('CFG', 'wallets.json 解析失败，跳过加密: ' + e.message); return false; }
+  if (obj.encrypted === true) { if (!quiet) info('CFG', 'wallets.json 已是加密格式，跳过'); return false; }
+  if (!obj.wallets || !obj.wallets.length) { if (!quiet) warn('CFG', 'wallets.json 没有账号，跳过加密'); return false; }
+  if (!password || password.length < 8) { if (!quiet) warn('CFG', '密码少于8位，跳过加密'); return false; }
+  const enc = encryptWalletsFile(obj, password);
+  try {
+    const back = decryptWalletsFile(enc, password);
+    if (!back.wallets || back.wallets.length !== obj.wallets.length) throw new Error('解密后账号数不符');
+  } catch (e) { warn('CFG', '加密自检失败，未写入: ' + e.message); return false; }
+  const tmp = WALLETS_FILE + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(enc), { mode: 0o600 });
+    fs.renameSync(tmp, WALLETS_FILE);
+  } catch (e) { warn('CFG', '加密写入失败，保持明文: ' + e.message); return false; }
+  finally { try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e) { } }
+  ok('CFG', `wallets.json 已加密(${obj.wallets.length} 个账号，密码来自 FTS_WALLET_PASSWORD)`);
+  if (!quiet) warn('CFG', '⚠️ 请务必记住密码，丢失后无法恢复钱包！');
+  return true;
+}
+// 自动加密: 只在设了 FTS_WALLET_PASSWORD 且钱包是明文时加密；没设密码=可选跳过，不阻断。
+function autoEncryptWallets(opts) {
+  const pwd = getWalletPassword();
+  if (!pwd) { info('CFG', '未设置 FTS_WALLET_PASSWORD，保持明文(加密可选，跳过)'); return false; }
+  return encryptWalletsWithPassword(pwd, opts);
+}
+// 内部命令: 向导保存后调用。有环境变量就加密，没有就跳过(不交互、不阻断)。
+function cmdAutoEncrypt() { autoEncryptWallets(); exitFlush(0); }
+// 交互式加密(内部保留)
 async function cmdEncrypt() {
   if (!fs.existsSync(WALLETS_FILE)) { fatal('CFG', '找不到 ' + WALLETS_FILE); exitFlush(1); return; }
   const raw = fs.readFileSync(WALLETS_FILE, 'utf8').replace(/^﻿/, '');
@@ -3511,26 +3541,13 @@ async function cmdEncrypt() {
   const p1 = lines[0], p2 = lines[1];
   if (!p1 || p1.length < 8) { fatal('CFG', '密码不能少于8位，已取消'); exitFlush(1); return; }
   if (p1 !== p2) { fatal('CFG', '两次密码不一致，已取消'); exitFlush(1); return; }
-  const enc = encryptWalletsFile(obj, p1);
-  // 验证能正确解密(防止写出坏文件把钱包锁死)
-  try {
-    const back = decryptWalletsFile(enc, p1);
-    if (!back.wallets || back.wallets.length !== obj.wallets.length) throw new Error('解密后账号数不符');
-  } catch (e) { fatal('CFG', '加密自检失败，未写入: ' + e.message); exitFlush(1); return; }
-  const tmp = WALLETS_FILE + '.tmp';
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(enc), { mode: 0o600 });
-    fs.renameSync(tmp, WALLETS_FILE);
-  } finally { if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (e) { } } }
-  // v1.7.1: 删除了原来的 `raw && (()=>{})();` —— 它是空操作，且 JS 字符串不可变，
-  // 无法可靠清零。真实保护来自 0600 权限 + AES-GCM 加密 + 明文不写日志/不回显。
-  ok('CFG', `wallets.json 已加密(${obj.wallets.length} 个账号)。运行时用环境变量 FTS_WALLET_PASSWORD 提供密码`);
-  warn('CFG', '⚠️ 请务必记住密码，丢失后无法恢复钱包！');
+  encryptWalletsWithPassword(p1);
   exitFlush(0);
 }
 
 // ---------------- 主流程 ----------------
 async function main() {
+  if (MODE === 'autoencrypt') return cmdAutoEncrypt();
   if (MODE === 'encrypt') return cmdEncrypt();
   if (MODE === 'sync-web') {
     try {
@@ -3556,6 +3573,7 @@ async function main() {
     : `自动 ×${CFG.GAS_MULT} (上限 ${CFG.GAS_MAX_GWEI} gwei)`;
   info('SYS', `FTS 引擎 v${VERSION} 启动 | 模式=${MODE} | 房间=${CFG.ROOMS.join(',')} | 抢位=[${CFG.SNIPE_MIN_COUNT},${CFG.SNIPE_MAX_COUNT}) | 延迟=${CFG.SNIPE_DELAY_MS}ms | 手续费=${gasDesc}`);
   info('SYS', `队列合约=${CFG.QUEUE_ADDR} | 中奖自动领取=${CFG.CLAIM_WIN ? '开' : '关'} | 组矿机=${CFG.MINER_ENABLED ? `${CFG.MINER_MODE}(固定${CFG.MINER_USD}U/老队列 ${CFG.MINER_QUEUE_ADDR})` : '关'} | 矿机产出领取=${CFG.MINING_CLAIM ? `开(每${Math.round(CFG.MINING_CLAIM_MS / 1000)}s检测)` : '关'}`);
+  autoEncryptWallets();   // 可选: 设了 FTS_WALLET_PASSWORD 且明文 -> 自动加密；没设 -> 保持明文不阻断
   const wallets = loadWallets();
   if (!wallets.length) { fatal('SYS', '没有可用账号，退出(错误码 21)'); exitFlush(21); return; }
   try { fs.chmodSync(WALLETS_FILE, 0o600); } catch (e) { }
@@ -4215,18 +4233,11 @@ UPDATEJS_EOF
 node --check update.js || die "update.js 生成异常(语法错误)"
 ok_msg "核心引擎 core.js + 只读探针 probe.js + 更新器 update.js 已写入"
 
-# --encrypt / --sync-web 都在"要求输入私钥"的向导之前退出
-if [ "$MODE" = "encrypt" ]; then
-  node core.js encrypt
-  exit $?
-fi
-if [ "$MODE" = "sync-web" ]; then
-  node core.js sync-web
-  exit $?
-fi
-
-# --probe 是纯只读探测，必须在"要求输入私钥"之前退出
+# --probe: 开头先探测网页合约(同步地址)，再做链上只读探测。都在"要求输入私钥"之前退出
 if [ "$MODE" = "probe" ]; then
+  echo ""
+  echo "  ---- 先从游戏网页探测最新合约 ----"
+  node core.js sync-web 2>&1 | sed 's/^/  /' || warn_msg "网页探测失败，继续链上探测"
   echo ""
   # 防止把 --help 之类的开关当成合约地址传下去
   case "$PROBE_ARGS" in
@@ -4240,7 +4251,7 @@ fi
 # --update: 原地替换脚本（私有仓库需在 config.json 写 UPDATE_TOKEN）
 if [ "$MODE" = "update" ]; then
   echo ""
-  node update.js --apply --current="1.8.1" --asset=autofts.sh
+  node update.js --apply --current="1.8.2" --asset=autofts.sh
   exit $?
 fi
 
@@ -5096,6 +5107,8 @@ if [ "$DO_INIT" = 1 ] || [ "$DO_WIZARD" = 1 ] || [ ! -f wallets.json ]; then
     echo ""
     ok_msg "配置已保存到 config.json（账号在 wallets.json）"
     echo "  当前设置: 房间=$(wiz_rooms_text) 抢位=${WIZ_MIN}~${WIZ_MAX} 延迟=${WIZ_DELAY}ms 手续费=$(wiz_gas_text)"
+    # 自动加密: 设了 FTS_WALLET_PASSWORD 就加密，没设就跳过(不阻断)
+    node core.js autoencrypt
     echo ""
     echo "下一步建议(按顺序):"
     echo "  bash autofts.sh --selftest   # 只读体检，一分钱不花"

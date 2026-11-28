@@ -132,18 +132,18 @@ function Show-Usage {
     Write-Host @'
 用法: powershell -ExecutionPolicy Bypass -File autofts.ps1 [模式]
 
-模式:
-  --probe      链上只读探测: 验证合约地址/函数在不在(完全不需要钱包私钥)
+模式(共 7 个):
+  --probe      先探测网页合约，再链上只读探测: 验证合约地址/函数在不在(不需要私钥)
+  --init       配置向导(房间/人数/延迟/手续费/账号)，配完即退出；改设置也用它
   --selftest   只读体检: 环境/依赖/RPC/合约/余额/授权 + 交易预演(一分钱不花)
   --dry-run    全流程预演: 走完所有逻辑但交易不上链
   --run        正式运行(默认)
-  --init       打开配置向导(房间/抢位区间/延迟/手续费/账号)，配完即退出
-  --settings   同 --init，随时回来改设置
-  --encrypt    加密 wallets.json(设置密码，运行时用 FTS_WALLET_PASSWORD 提供)
-  --sync-web   从游戏网页探测合约地址(默认只提示，资金字段需显式允许才写回)
   --update     一键更新到最新版本(原地替换脚本，支持私有仓库)
-  --stop       停止后台运行的引擎
   --help       查看本帮助
+
+说明:
+  · 加密可选: 设了环境变量 FTS_WALLET_PASSWORD 就自动加密，不设则保持明文(不影响运行)
+  · 停止运行: 直接 Ctrl+C
 
 建议首次使用顺序:
   --probe  ->  --init  ->  --selftest  ->  --dry-run  ->  --run
@@ -261,12 +261,8 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     elseif ($a -eq '--selftest') { $Mode = 'selftest' }
     elseif ($a -eq '--dry-run')  { $Mode = 'dry-run' }
     elseif ($a -eq '--run')      { $Mode = 'run' }
-    elseif ($a -eq '--encrypt')  { $Mode = 'encrypt' }
-    elseif ($a -eq '--sync-web') { $Mode = 'sync-web' }
     elseif ($a -eq '--init')     { $DoInit = $true }
-    elseif ($a -eq '--settings') { $DoWizard = $true }
     elseif ($a -eq '--update')   { $Mode = 'update' }
-    elseif ($a -eq '--stop')     { Stop-Engine }
     elseif ($a -eq '-h' -or $a -eq '--help') { Show-Usage }
     else {
         Write-Host "未知参数: $a (用 --help 查看用法)" -ForegroundColor Red
@@ -373,26 +369,18 @@ if ($LASTEXITCODE -ne 0) { Write-Die "probe.js 生成异常(语法错误)" }
 if ($LASTEXITCODE -ne 0) { Write-Die "update.js 生成异常(语法错误)" }
 Write-Ok "核心引擎 core.js + 只读探针 probe.js + 更新器 update.js 已写入"
 
-# --encrypt / --sync-web 都在"要求输入私钥"的向导之前退出
-if ($Mode -eq 'encrypt') {
-    Write-Host ""
-    & $Script:NodeExe core.js encrypt
-    exit $LASTEXITCODE
-}
-if ($Mode -eq 'sync-web') {
-    Write-Host ""
-    & $Script:NodeExe core.js sync-web
-    exit $LASTEXITCODE
-}
-
-# --probe 是纯只读探测，必须在"要求输入私钥"之前退出
+# --probe: 开头先探测网页合约(同步地址)，再做链上只读探测。都在"要求输入私钥"之前退出
 if ($Mode -eq 'probe') {
+    Write-Host ""
+    Write-Host "  ---- 先从游戏网页探测最新合约 ----"
+    try { & $Script:NodeExe core.js sync-web 2>&1 | ForEach-Object { Write-Host "  $_" } }
+    catch { Write-WarnMsg "网页探测失败，继续链上探测" }
+    Write-Host ""
     # 和 bash 版对齐: 别把 --help 之类的开关当成合约地址传给 probe.js
     if ($ProbeArgs -and ($ProbeArgs | Where-Object { "$_" -like '-*' })) {
         Write-WarnMsg "probe 只接受 <合约地址> [钱包地址]，不要带 -- 参数"
         $ProbeArgs = @()
     }
-    Write-Host ""
     & $Script:NodeExe probe.js @ProbeArgs
     exit $LASTEXITCODE
 }
@@ -1269,6 +1257,8 @@ if ($DoInit -or $DoWizard -or (-not (Test-Path -LiteralPath 'wallets.json'))) {
         Write-Host ""
         Write-Ok "配置已保存到 config.json（账号在 wallets.json）"
         Write-Host "  当前设置: 房间=$(Get-RoomsText) 抢位=$($Script:WizMin)~$($Script:WizMax) 延迟=$($Script:WizDelay)ms 手续费=$(Get-GasText)"
+        # 自动加密: 设了 FTS_WALLET_PASSWORD 就加密，没设就跳过(不阻断)
+        & $Script:NodeExe core.js autoencrypt
         Write-Host ""
         Write-Host "下一步建议(按顺序):"
         Write-Host "  powershell -ExecutionPolicy Bypass -File autofts.ps1 --selftest   # 只读体检，一分钱不花"
